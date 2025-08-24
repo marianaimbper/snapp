@@ -1,155 +1,202 @@
-import argparse
-import os
+# Copyright (c) OpenMMLab. All rights reserved.
+import os.path as osp
+import pickle
+import shutil
+import tempfile
+import time
 
 import torch
-from torch import nn
-from torch.nn import functional as F
-import torchgeometry as tgm
+import torch.distributed as dist
 
-from datasets import VITONDataset, VITONDataLoader
-from networks import SegGenerator, GMM, ALIASGenerator
-from utils import gen_noise, load_checkpoint, save_images
+import annotator.uniformer.mmcv as mmcv
+from annotator.uniformer.mmcv.runner import get_dist_info
 
 
-def get_opt():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--name', type=str, required=True)
+def single_gpu_test(model, data_loader):
+    """Test model with a single gpu.
 
-    parser.add_argument('-b', '--batch_size', type=int, default=1)
-    parser.add_argument('-j', '--workers', type=int, default=1)
-    parser.add_argument('--load_height', type=int, default=1024)
-    parser.add_argument('--load_width', type=int, default=768)
-    parser.add_argument('--shuffle', action='store_true')
+    This method tests model with a single gpu and displays test progress bar.
 
-    parser.add_argument('--dataset_dir', type=str, default='./datasets/')
-    parser.add_argument('--dataset_mode', type=str, default='test')
-    parser.add_argument('--dataset_list', type=str, default='test_pairs.txt')
-    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints/')
-    parser.add_argument('--save_dir', type=str, default='./results/')
+    Args:
+        model (nn.Module): Model to be tested.
+        data_loader (nn.Dataloader): Pytorch data loader.
 
-    parser.add_argument('--display_freq', type=int, default=1)
+    Returns:
+        list: The prediction results.
+    """
+    model.eval()
+    results = []
+    dataset = data_loader.dataset
+    prog_bar = mmcv.ProgressBar(len(dataset))
+    for data in data_loader:
+        with torch.no_grad():
+            result = model(return_loss=False, **data)
+        results.extend(result)
 
-    parser.add_argument('--seg_checkpoint', type=str, default='seg_final.pth')
-    parser.add_argument('--gmm_checkpoint', type=str, default='gmm_final.pth')
-    parser.add_argument('--alias_checkpoint', type=str, default='alias_final.pth')
-
-    # common
-    parser.add_argument('--semantic_nc', type=int, default=13, help='# of human-parsing map classes')
-    parser.add_argument('--init_type', choices=['normal', 'xavier', 'xavier_uniform', 'kaiming', 'orthogonal', 'none'], default='xavier')
-    parser.add_argument('--init_variance', type=float, default=0.02, help='variance of the initialization distribution')
-
-    # for GMM
-    parser.add_argument('--grid_size', type=int, default=5)
-
-    # for ALIASGenerator
-    parser.add_argument('--norm_G', type=str, default='spectralaliasinstance')
-    parser.add_argument('--ngf', type=int, default=64, help='# of generator filters in the first conv layer')
-    parser.add_argument('--num_upsampling_layers', choices=['normal', 'more', 'most'], default='most',
-                        help='If \'more\', add upsampling layer between the two middle resnet blocks. '
-                             'If \'most\', also add one more (upsampling + resnet) layer at the end of the generator.')
-
-    opt = parser.parse_args()
-    return opt
+        # Assume result has the same length of batch_size
+        # refer to https://github.com/open-mmlab/mmcv/issues/985
+        batch_size = len(result)
+        for _ in range(batch_size):
+            prog_bar.update()
+    return results
 
 
-def test(opt, seg, gmm, alias):
-    up = nn.Upsample(size=(opt.load_height, opt.load_width), mode='bilinear')
-    gauss = tgm.image.GaussianBlur((15, 15), (3, 3))
-    gauss.cuda()
+def multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
+    """Test model with multiple gpus.
 
-    test_dataset = VITONDataset(opt)
-    test_loader = VITONDataLoader(opt, test_dataset)
+    This method tests model with multiple gpus and collects the results
+    under two different modes: gpu and cpu modes. By setting
+    ``gpu_collect=True``, it encodes results to gpu tensors and use gpu
+    communication for results collection. On cpu mode it saves the results on
+    different gpus to ``tmpdir`` and collects them by the rank 0 worker.
 
-    with torch.no_grad():
-        for i, inputs in enumerate(test_loader.data_loader):
-            img_names = inputs['img_name']
-            c_names = inputs['c_name']['unpaired']
+    Args:
+        model (nn.Module): Model to be tested.
+        data_loader (nn.Dataloader): Pytorch data loader.
+        tmpdir (str): Path of directory to save the temporary results from
+            different gpus under cpu mode.
+        gpu_collect (bool): Option to use either gpu or cpu to collect results.
 
-            img_agnostic = inputs['img_agnostic'].cuda()
-            parse_agnostic = inputs['parse_agnostic'].cuda()
-            pose = inputs['pose'].cuda()
-            c = inputs['cloth']['unpaired'].cuda()
-            cm = inputs['cloth_mask']['unpaired'].cuda()
+    Returns:
+        list: The prediction results.
+    """
+    model.eval()
+    results = []
+    dataset = data_loader.dataset
+    rank, world_size = get_dist_info()
+    if rank == 0:
+        prog_bar = mmcv.ProgressBar(len(dataset))
+    time.sleep(2)  # This line can prevent deadlock problem in some cases.
+    for i, data in enumerate(data_loader):
+        with torch.no_grad():
+            result = model(return_loss=False, **data)
+        results.extend(result)
 
-            # Part 1. Segmentation generation
-            parse_agnostic_down = F.interpolate(parse_agnostic, size=(256, 192), mode='bilinear')
-            pose_down = F.interpolate(pose, size=(256, 192), mode='bilinear')
-            c_masked_down = F.interpolate(c * cm, size=(256, 192), mode='bilinear')
-            cm_down = F.interpolate(cm, size=(256, 192), mode='bilinear')
-            seg_input = torch.cat((cm_down, c_masked_down, parse_agnostic_down, pose_down, gen_noise(cm_down.size()).cuda()), dim=1)
+        if rank == 0:
+            batch_size = len(result)
+            batch_size_all = batch_size * world_size
+            if batch_size_all + prog_bar.completed > len(dataset):
+                batch_size_all = len(dataset) - prog_bar.completed
+            for _ in range(batch_size_all):
+                prog_bar.update()
 
-            parse_pred_down = seg(seg_input)
-            parse_pred = gauss(up(parse_pred_down))
-            parse_pred = parse_pred.argmax(dim=1)[:, None]
-
-            parse_old = torch.zeros(parse_pred.size(0), 13, opt.load_height, opt.load_width, dtype=torch.float).cuda()
-            parse_old.scatter_(1, parse_pred, 1.0)
-
-            labels = {
-                0:  ['background',  [0]],
-                1:  ['paste',       [2, 4, 7, 8, 9, 10, 11]],
-                2:  ['upper',       [3]],
-                3:  ['hair',        [1]],
-                4:  ['left_arm',    [5]],
-                5:  ['right_arm',   [6]],
-                6:  ['noise',       [12]]
-            }
-            parse = torch.zeros(parse_pred.size(0), 7, opt.load_height, opt.load_width, dtype=torch.float).cuda()
-            for j in range(len(labels)):
-                for label in labels[j][1]:
-                    parse[:, j] += parse_old[:, label]
-
-            # Part 2. Clothes Deformation
-            agnostic_gmm = F.interpolate(img_agnostic, size=(256, 192), mode='nearest')
-            parse_cloth_gmm = F.interpolate(parse[:, 2:3], size=(256, 192), mode='nearest')
-            pose_gmm = F.interpolate(pose, size=(256, 192), mode='nearest')
-            c_gmm = F.interpolate(c, size=(256, 192), mode='nearest')
-            gmm_input = torch.cat((parse_cloth_gmm, pose_gmm, agnostic_gmm), dim=1)
-
-            _, warped_grid = gmm(gmm_input, c_gmm)
-            warped_c = F.grid_sample(c, warped_grid, padding_mode='border')
-            warped_cm = F.grid_sample(cm, warped_grid, padding_mode='border')
-
-            # Part 3. Try-on synthesis
-            misalign_mask = parse[:, 2:3] - warped_cm
-            misalign_mask[misalign_mask < 0.0] = 0.0
-            parse_div = torch.cat((parse, misalign_mask), dim=1)
-            parse_div[:, 2:3] -= misalign_mask
-
-            output = alias(torch.cat((img_agnostic, pose, warped_c), dim=1), parse, parse_div, misalign_mask)
-
-            unpaired_names = []
-            for img_name, c_name in zip(img_names, c_names):
-                unpaired_names.append('{}_{}'.format(img_name.split('_')[0], c_name))
-
-            save_images(output, unpaired_names, os.path.join(opt.save_dir, opt.name))
-
-            if (i + 1) % opt.display_freq == 0:
-                print("step: {}".format(i + 1))
+    # collect results from all ranks
+    if gpu_collect:
+        results = collect_results_gpu(results, len(dataset))
+    else:
+        results = collect_results_cpu(results, len(dataset), tmpdir)
+    return results
 
 
-def main():
-    opt = get_opt()
-    print(opt)
+def collect_results_cpu(result_part, size, tmpdir=None):
+    """Collect results under cpu mode.
 
-    if not os.path.exists(os.path.join(opt.save_dir, opt.name)):
-        os.makedirs(os.path.join(opt.save_dir, opt.name))
+    On cpu mode, this function will save the results on different gpus to
+    ``tmpdir`` and collect them by the rank 0 worker.
 
-    seg = SegGenerator(opt, input_nc=opt.semantic_nc + 8, output_nc=opt.semantic_nc)
-    gmm = GMM(opt, inputA_nc=7, inputB_nc=3)
-    opt.semantic_nc = 7
-    alias = ALIASGenerator(opt, input_nc=9)
-    opt.semantic_nc = 13
+    Args:
+        result_part (list): Result list containing result parts
+            to be collected.
+        size (int): Size of the results, commonly equal to length of
+            the results.
+        tmpdir (str | None): temporal directory for collected results to
+            store. If set to None, it will create a random temporal directory
+            for it.
 
-    load_checkpoint(seg, os.path.join(opt.checkpoint_dir, opt.seg_checkpoint))
-    load_checkpoint(gmm, os.path.join(opt.checkpoint_dir, opt.gmm_checkpoint))
-    load_checkpoint(alias, os.path.join(opt.checkpoint_dir, opt.alias_checkpoint))
+    Returns:
+        list: The collected results.
+    """
+    rank, world_size = get_dist_info()
+    # create a tmp dir if it is not specified
+    if tmpdir is None:
+        MAX_LEN = 512
+        # 32 is whitespace
+        dir_tensor = torch.full((MAX_LEN, ),
+                                32,
+                                dtype=torch.uint8,
+                                device='cuda')
+        if rank == 0:
+            mmcv.mkdir_or_exist('.dist_test')
+            tmpdir = tempfile.mkdtemp(dir='.dist_test')
+            tmpdir = torch.tensor(
+                bytearray(tmpdir.encode()), dtype=torch.uint8, device='cuda')
+            dir_tensor[:len(tmpdir)] = tmpdir
+        dist.broadcast(dir_tensor, 0)
+        tmpdir = dir_tensor.cpu().numpy().tobytes().decode().rstrip()
+    else:
+        mmcv.mkdir_or_exist(tmpdir)
+    # dump the part result to the dir
+    mmcv.dump(result_part, osp.join(tmpdir, f'part_{rank}.pkl'))
+    dist.barrier()
+    # collect all parts
+    if rank != 0:
+        return None
+    else:
+        # load results of all parts from tmp dir
+        part_list = []
+        for i in range(world_size):
+            part_file = osp.join(tmpdir, f'part_{i}.pkl')
+            part_result = mmcv.load(part_file)
+            # When data is severely insufficient, an empty part_result
+            # on a certain gpu could makes the overall outputs empty.
+            if part_result:
+                part_list.append(part_result)
+        # sort the results
+        ordered_results = []
+        for res in zip(*part_list):
+            ordered_results.extend(list(res))
+        # the dataloader may pad some samples
+        ordered_results = ordered_results[:size]
+        # remove tmp dir
+        shutil.rmtree(tmpdir)
+        return ordered_results
 
-    seg.cuda().eval()
-    gmm.cuda().eval()
-    alias.cuda().eval()
-    test(opt, seg, gmm, alias)
 
+def collect_results_gpu(result_part, size):
+    """Collect results under gpu mode.
 
-if __name__ == '__main__':
-    main()
+    On gpu mode, this function will encode results to gpu tensors and use gpu
+    communication for results collection.
+
+    Args:
+        result_part (list): Result list containing result parts
+            to be collected.
+        size (int): Size of the results, commonly equal to length of
+            the results.
+
+    Returns:
+        list: The collected results.
+    """
+    rank, world_size = get_dist_info()
+    # dump result part to tensor with pickle
+    part_tensor = torch.tensor(
+        bytearray(pickle.dumps(result_part)), dtype=torch.uint8, device='cuda')
+    # gather all result part tensor shape
+    shape_tensor = torch.tensor(part_tensor.shape, device='cuda')
+    shape_list = [shape_tensor.clone() for _ in range(world_size)]
+    dist.all_gather(shape_list, shape_tensor)
+    # padding result part tensor to max length
+    shape_max = torch.tensor(shape_list).max()
+    part_send = torch.zeros(shape_max, dtype=torch.uint8, device='cuda')
+    part_send[:shape_tensor[0]] = part_tensor
+    part_recv_list = [
+        part_tensor.new_zeros(shape_max) for _ in range(world_size)
+    ]
+    # gather all result part
+    dist.all_gather(part_recv_list, part_send)
+
+    if rank == 0:
+        part_list = []
+        for recv, shape in zip(part_recv_list, shape_list):
+            part_result = pickle.loads(recv[:shape[0]].cpu().numpy().tobytes())
+            # When data is severely insufficient, an empty part_result
+            # on a certain gpu could makes the overall outputs empty.
+            if part_result:
+                part_list.append(part_result)
+        # sort the results
+        ordered_results = []
+        for res in zip(*part_list):
+            ordered_results.extend(list(res))
+        # the dataloader may pad some samples
+        ordered_results = ordered_results[:size]
+        return ordered_results

@@ -1,78 +1,32 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) OpenMMLab. All rights reserved.
+r"""Modified from https://github.com/facebookresearch/detectron2/blob/master/detectron2/layers/wrappers.py  # noqa: E501
+
+Wrap some nn modules to support empty tensor input. Currently, these wrappers
+are mainly used in mask heads like fcn_mask_head and maskiou_heads since mask
+heads are trained on only positive RoIs.
 """
-Wrappers around on some nn functions, mainly to support empty tensors.
+import math
 
-Ideally, add support directly in PyTorch to empty tensors in those functions.
-
-These can be removed once https://github.com/pytorch/pytorch/issues/12013
-is implemented
-"""
-
-import warnings
-from typing import List, Optional
 import torch
-from torch.nn import functional as F
+import torch.nn as nn
+from torch.nn.modules.utils import _pair, _triple
 
-from detectron2.utils.env import TORCH_VERSION
+from .registry import CONV_LAYERS, UPSAMPLE_LAYERS
 
-
-def shapes_to_tensor(x: List[int], device: Optional[torch.device] = None) -> torch.Tensor:
-    """
-    Turn a list of integer scalars or integer Tensor scalars into a vector,
-    in a way that's both traceable and scriptable.
-
-    In tracing, `x` should be a list of scalar Tensor, so the output can trace to the inputs.
-    In scripting or eager, `x` should be a list of int.
-    """
-    if torch.jit.is_scripting():
-        return torch.as_tensor(x, device=device)
-    if torch.jit.is_tracing():
-        assert all(
-            [isinstance(t, torch.Tensor) for t in x]
-        ), "Shape should be tensor during tracing!"
-        # as_tensor should not be used in tracing because it records a constant
-        ret = torch.stack(x)
-        if ret.device != device:  # avoid recording a hard-coded device if not necessary
-            ret = ret.to(device=device)
-        return ret
-    return torch.as_tensor(x, device=device)
+if torch.__version__ == 'parrots':
+    TORCH_VERSION = torch.__version__
+else:
+    # torch.__version__ could be 1.3.1+cu92, we only need the first two
+    # for comparison
+    TORCH_VERSION = tuple(int(x) for x in torch.__version__.split('.')[:2])
 
 
-def check_if_dynamo_compiling():
-    if TORCH_VERSION >= (1, 14):
-        from torch._dynamo import is_compiling
-
-        return is_compiling()
-    else:
-        return False
+def obsolete_torch_version(torch_version, version_threshold):
+    return torch_version == 'parrots' or torch_version <= version_threshold
 
 
-def cat(tensors: List[torch.Tensor], dim: int = 0):
-    """
-    Efficient version of torch.cat that avoids a copy if there is only a single element in a list
-    """
-    assert isinstance(tensors, (list, tuple))
-    if len(tensors) == 1:
-        return tensors[0]
-    return torch.cat(tensors, dim)
+class NewEmptyTensorOp(torch.autograd.Function):
 
-
-def empty_input_loss_func_wrapper(loss_func):
-    def wrapped_loss_func(input, target, *, reduction="mean", **kwargs):
-        """
-        Same as `loss_func`, but returns 0 (instead of nan) for empty inputs.
-        """
-        if target.numel() == 0 and reduction == "mean":
-            return input.sum() * 0.0  # connect the gradient
-        return loss_func(input, target, reduction=reduction, **kwargs)
-
-    return wrapped_loss_func
-
-
-cross_entropy = empty_input_loss_func_wrapper(F.cross_entropy)
-
-
-class _NewEmptyTensorOp(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, new_shape):
         ctx.shape = x.shape
@@ -81,82 +35,146 @@ class _NewEmptyTensorOp(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         shape = ctx.shape
-        return _NewEmptyTensorOp.apply(grad, shape), None
+        return NewEmptyTensorOp.apply(grad, shape), None
 
 
-class Conv2d(torch.nn.Conv2d):
-    """
-    A wrapper around :class:`torch.nn.Conv2d` to support empty inputs and more features.
-    """
-
-    def __init__(self, *args, **kwargs):
-        """
-        Extra keyword arguments supported in addition to those in `torch.nn.Conv2d`:
-
-        Args:
-            norm (nn.Module, optional): a normalization layer
-            activation (callable(Tensor) -> Tensor): a callable activation function
-
-        It assumes that norm layer is used before activation.
-        """
-        norm = kwargs.pop("norm", None)
-        activation = kwargs.pop("activation", None)
-        super().__init__(*args, **kwargs)
-
-        self.norm = norm
-        self.activation = activation
+@CONV_LAYERS.register_module('Conv', force=True)
+class Conv2d(nn.Conv2d):
 
     def forward(self, x):
-        # torchscript does not support SyncBatchNorm yet
-        # https://github.com/pytorch/pytorch/issues/40507
-        # and we skip these codes in torchscript since:
-        # 1. currently we only support torchscript in evaluation mode
-        # 2. features needed by exporting module to torchscript are added in PyTorch 1.6 or
-        # later version, `Conv2d` in these PyTorch versions has already supported empty inputs.
-        if not torch.jit.is_scripting():
-            # Dynamo doesn't support context managers yet
-            is_dynamo_compiling = check_if_dynamo_compiling()
-            if not is_dynamo_compiling:
-                with warnings.catch_warnings(record=True):
-                    if x.numel() == 0 and self.training:
-                        # https://github.com/pytorch/pytorch/issues/12013
-                        assert not isinstance(
-                            self.norm, torch.nn.SyncBatchNorm
-                        ), "SyncBatchNorm does not support empty inputs!"
+        if x.numel() == 0 and obsolete_torch_version(TORCH_VERSION, (1, 4)):
+            out_shape = [x.shape[0], self.out_channels]
+            for i, k, p, s, d in zip(x.shape[-2:], self.kernel_size,
+                                     self.padding, self.stride, self.dilation):
+                o = (i + 2 * p - (d * (k - 1) + 1)) // s + 1
+                out_shape.append(o)
+            empty = NewEmptyTensorOp.apply(x, out_shape)
+            if self.training:
+                # produce dummy gradient to avoid DDP warning.
+                dummy = sum(x.view(-1)[0] for x in self.parameters()) * 0.0
+                return empty + dummy
+            else:
+                return empty
 
-        x = F.conv2d(
-            x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups
-        )
-        if self.norm is not None:
-            x = self.norm(x)
-        if self.activation is not None:
-            x = self.activation(x)
-        return x
+        return super().forward(x)
 
 
-ConvTranspose2d = torch.nn.ConvTranspose2d
-BatchNorm2d = torch.nn.BatchNorm2d
-interpolate = F.interpolate
-Linear = torch.nn.Linear
+@CONV_LAYERS.register_module('Conv3d', force=True)
+class Conv3d(nn.Conv3d):
+
+    def forward(self, x):
+        if x.numel() == 0 and obsolete_torch_version(TORCH_VERSION, (1, 4)):
+            out_shape = [x.shape[0], self.out_channels]
+            for i, k, p, s, d in zip(x.shape[-3:], self.kernel_size,
+                                     self.padding, self.stride, self.dilation):
+                o = (i + 2 * p - (d * (k - 1) + 1)) // s + 1
+                out_shape.append(o)
+            empty = NewEmptyTensorOp.apply(x, out_shape)
+            if self.training:
+                # produce dummy gradient to avoid DDP warning.
+                dummy = sum(x.view(-1)[0] for x in self.parameters()) * 0.0
+                return empty + dummy
+            else:
+                return empty
+
+        return super().forward(x)
 
 
-def nonzero_tuple(x):
-    """
-    A 'as_tuple=True' version of torch.nonzero to support torchscript.
-    because of https://github.com/pytorch/pytorch/issues/38718
-    """
-    if torch.jit.is_scripting():
-        if x.dim() == 0:
-            return x.unsqueeze(0).nonzero().unbind(1)
-        return x.nonzero().unbind(1)
-    else:
-        return x.nonzero(as_tuple=True)
+@CONV_LAYERS.register_module()
+@CONV_LAYERS.register_module('deconv')
+@UPSAMPLE_LAYERS.register_module('deconv', force=True)
+class ConvTranspose2d(nn.ConvTranspose2d):
+
+    def forward(self, x):
+        if x.numel() == 0 and obsolete_torch_version(TORCH_VERSION, (1, 4)):
+            out_shape = [x.shape[0], self.out_channels]
+            for i, k, p, s, d, op in zip(x.shape[-2:], self.kernel_size,
+                                         self.padding, self.stride,
+                                         self.dilation, self.output_padding):
+                out_shape.append((i - 1) * s - 2 * p + (d * (k - 1) + 1) + op)
+            empty = NewEmptyTensorOp.apply(x, out_shape)
+            if self.training:
+                # produce dummy gradient to avoid DDP warning.
+                dummy = sum(x.view(-1)[0] for x in self.parameters()) * 0.0
+                return empty + dummy
+            else:
+                return empty
+
+        return super().forward(x)
 
 
-@torch.jit.script_if_tracing
-def move_device_like(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    """
-    Tracing friendly way to cast tensor to another tensor's device. Device will be treated
-    as constant during tracing, scripting the casting process as whole can workaround this issue.
-    """
-    return src.to(dst.device)
+@CONV_LAYERS.register_module()
+@CONV_LAYERS.register_module('deconv3d')
+@UPSAMPLE_LAYERS.register_module('deconv3d', force=True)
+class ConvTranspose3d(nn.ConvTranspose3d):
+
+    def forward(self, x):
+        if x.numel() == 0 and obsolete_torch_version(TORCH_VERSION, (1, 4)):
+            out_shape = [x.shape[0], self.out_channels]
+            for i, k, p, s, d, op in zip(x.shape[-3:], self.kernel_size,
+                                         self.padding, self.stride,
+                                         self.dilation, self.output_padding):
+                out_shape.append((i - 1) * s - 2 * p + (d * (k - 1) + 1) + op)
+            empty = NewEmptyTensorOp.apply(x, out_shape)
+            if self.training:
+                # produce dummy gradient to avoid DDP warning.
+                dummy = sum(x.view(-1)[0] for x in self.parameters()) * 0.0
+                return empty + dummy
+            else:
+                return empty
+
+        return super().forward(x)
+
+
+class MaxPool2d(nn.MaxPool2d):
+
+    def forward(self, x):
+        # PyTorch 1.9 does not support empty tensor inference yet
+        if x.numel() == 0 and obsolete_torch_version(TORCH_VERSION, (1, 9)):
+            out_shape = list(x.shape[:2])
+            for i, k, p, s, d in zip(x.shape[-2:], _pair(self.kernel_size),
+                                     _pair(self.padding), _pair(self.stride),
+                                     _pair(self.dilation)):
+                o = (i + 2 * p - (d * (k - 1) + 1)) / s + 1
+                o = math.ceil(o) if self.ceil_mode else math.floor(o)
+                out_shape.append(o)
+            empty = NewEmptyTensorOp.apply(x, out_shape)
+            return empty
+
+        return super().forward(x)
+
+
+class MaxPool3d(nn.MaxPool3d):
+
+    def forward(self, x):
+        # PyTorch 1.9 does not support empty tensor inference yet
+        if x.numel() == 0 and obsolete_torch_version(TORCH_VERSION, (1, 9)):
+            out_shape = list(x.shape[:2])
+            for i, k, p, s, d in zip(x.shape[-3:], _triple(self.kernel_size),
+                                     _triple(self.padding),
+                                     _triple(self.stride),
+                                     _triple(self.dilation)):
+                o = (i + 2 * p - (d * (k - 1) + 1)) / s + 1
+                o = math.ceil(o) if self.ceil_mode else math.floor(o)
+                out_shape.append(o)
+            empty = NewEmptyTensorOp.apply(x, out_shape)
+            return empty
+
+        return super().forward(x)
+
+
+class Linear(torch.nn.Linear):
+
+    def forward(self, x):
+        # empty tensor forward of Linear layer is supported in Pytorch 1.6
+        if x.numel() == 0 and obsolete_torch_version(TORCH_VERSION, (1, 5)):
+            out_shape = [x.shape[0], self.out_features]
+            empty = NewEmptyTensorOp.apply(x, out_shape)
+            if self.training:
+                # produce dummy gradient to avoid DDP warning.
+                dummy = sum(x.view(-1)[0] for x in self.parameters()) * 0.0
+                return empty + dummy
+            else:
+                return empty
+
+        return super().forward(x)

@@ -1,21 +1,44 @@
-import torch.nn as nn
-import torch
-import torch.distributed as dist
+# Copyright (c) OpenMMLab. All rights reserved.
+import numpy as np
 
-class GlobalAvgPool2d(nn.Module):
-    def __init__(self):
-        """Global average pooling over the input's spatial dimensions"""
-        super(GlobalAvgPool2d, self).__init__()
+import annotator.uniformer.mmcv as mmcv
 
-    def forward(self, inputs):
-        in_size = inputs.size()
-        return inputs.view((in_size[0], in_size[1], -1)).mean(dim=2)
+try:
+    import torch
+except ImportError:
+    torch = None
 
-class SingleGPU(nn.Module):
-    def __init__(self, module):
-        super(SingleGPU, self).__init__()
-        self.module=module
 
-    def forward(self, input):
-        return self.module(input.cuda(non_blocking=True))
+def tensor2imgs(tensor, mean=(0, 0, 0), std=(1, 1, 1), to_rgb=True):
+    """Convert tensor to 3-channel images.
 
+    Args:
+        tensor (torch.Tensor): Tensor that contains multiple images, shape (
+            N, C, H, W).
+        mean (tuple[float], optional): Mean of images. Defaults to (0, 0, 0).
+        std (tuple[float], optional): Standard deviation of images.
+            Defaults to (1, 1, 1).
+        to_rgb (bool, optional): Whether the tensor was converted to RGB
+            format in the first place. If so, convert it back to BGR.
+            Defaults to True.
+
+    Returns:
+        list[np.ndarray]: A list that contains multiple images.
+    """
+
+    if torch is None:
+        raise RuntimeError('pytorch is not installed')
+    assert torch.is_tensor(tensor) and tensor.ndim == 4
+    assert len(mean) == 3
+    assert len(std) == 3
+
+    num_imgs = tensor.size(0)
+    mean = np.array(mean, dtype=np.float32)
+    std = np.array(std, dtype=np.float32)
+    imgs = []
+    for img_id in range(num_imgs):
+        img = tensor[img_id, ...].cpu().numpy().transpose(1, 2, 0)
+        img = mmcv.imdenormalize(
+            img, mean, std, to_bgr=to_rgb).astype(np.uint8)
+        imgs.append(np.ascontiguousarray(img))
+    return imgs
