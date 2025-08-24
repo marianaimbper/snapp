@@ -1,19 +1,20 @@
 import pdb
-from pathlib import Path
 import sys
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).absolute().parents[0].absolute()
 sys.path.insert(0, str(PROJECT_ROOT))
 import os
-import torch
-import numpy as np
+
 import cv2
+import numpy as np
+import torch
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
 from datasets.simple_extractor_dataset import SimpleFolderDataset
-from utils.transforms import transform_logits
-from tqdm import tqdm
 from PIL import Image
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from utils.transforms import transform_logits, get_affine_transform
 
 
 def get_palette(num_cls):
@@ -80,7 +81,6 @@ def delete_irregular(logits_result):
     return parsing_result, wear_type
 
 
-
 def hole_fill(img):
     img_copy = img.copy()
     mask = np.zeros((img.shape[0] + 2, img.shape[1] + 2), dtype=np.uint8)
@@ -88,6 +88,7 @@ def hole_fill(img):
     img_inverse = cv2.bitwise_not(img)
     dst = cv2.bitwise_or(img_copy, img_inverse)
     return dst
+
 
 def refine_mask(mask):
     contours, hierarchy = cv2.findContours(mask.astype(np.uint8),
@@ -102,9 +103,10 @@ def refine_mask(mask):
         cv2.drawContours(refine_mask, contours, i, color=255, thickness=-1)
         # keep large area in skin case
         for j in range(len(area)):
-          if j != i and area[i] > 2000:
-             cv2.drawContours(refine_mask, contours, j, color=255, thickness=-1)
+            if j != i and area[i] > 2000:
+                cv2.drawContours(refine_mask, contours, j, color=255, thickness=-1)
     return refine_mask
+
 
 def refine_hole(parsing_result_filled, parsing_result, arm_mask):
     filled_hole = cv2.bitwise_and(np.where(parsing_result_filled == 4, 255, 0),
@@ -118,61 +120,69 @@ def refine_hole(parsing_result_filled, parsing_result, arm_mask):
             cv2.drawContours(refine_hole_mask, contours, i, color=255, thickness=-1)
     return refine_hole_mask + arm_mask
 
+
 def onnx_inference(session, lip_session, input_dir):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.406, 0.456, 0.485], std=[0.225, 0.224, 0.229])
     ])
     dataset = SimpleFolderDataset(root=input_dir, input_size=[512, 512], transform=transform)
-    dataloader = DataLoader(dataset)
+    # dataloader = DataLoader(dataset)
     with torch.no_grad():
-        for _, batch in enumerate(tqdm(dataloader)):
-            image, meta = batch
-            c = meta['center'].numpy()[0]
-            s = meta['scale'].numpy()[0]
-            w = meta['width'].numpy()[0]
-            h = meta['height'].numpy()[0]
-            output = session.run(None, {"input.1": image.numpy().astype(np.float32)})
-            upsample = torch.nn.Upsample(size=[512, 512], mode='bilinear', align_corners=True)
-            upsample_output = upsample(torch.from_numpy(output[1][0]).unsqueeze(0))
-            upsample_output = upsample_output.squeeze()
-            upsample_output = upsample_output.permute(1, 2, 0)  # CHW -> HWC
-            logits_result = transform_logits(upsample_output.data.cpu().numpy(), c, s, w, h, input_size=[512, 512])
-            parsing_result = np.argmax(logits_result, axis=2)
-            parsing_result = np.pad(parsing_result, pad_width=1, mode='constant', constant_values=0)
-            # try holefilling the clothes part
-            arm_mask = (parsing_result == 14).astype(np.float32) \
-                       + (parsing_result == 15).astype(np.float32)
-            upper_cloth_mask = (parsing_result == 4).astype(np.float32) + arm_mask
-            img = np.where(upper_cloth_mask, 255, 0)
-            dst = hole_fill(img.astype(np.uint8))
-            parsing_result_filled = dst / 255 * 4
-            parsing_result_woarm = np.where(parsing_result_filled == 4, parsing_result_filled, parsing_result)
-            # add back arm and refined hole between arm and cloth
-            refine_hole_mask = refine_hole(parsing_result_filled.astype(np.uint8), parsing_result.astype(np.uint8),
-                                           arm_mask.astype(np.uint8))
-            parsing_result = np.where(refine_hole_mask, parsing_result, parsing_result_woarm)
-            # remove padding
-            parsing_result = parsing_result[1:-1, 1:-1]
+        # for _, batch in enumerate(tqdm(dataloader, disable=True)):
+        image, meta = dataset[0]
+        image = image.unsqueeze(0)
+
+        # image, meta = batch
+        c = meta['center']
+        h = meta['height']
+        w = meta['width']
+        s = meta['scale']
+        output = session.run(None, {"input.1": image.numpy().astype(np.float32)})
+        upsample = torch.nn.Upsample(size=[512, 512], mode='bilinear', align_corners=True)
+        upsample_output = upsample(torch.from_numpy(output[1][0]).unsqueeze(0))
+        upsample_output = upsample_output.squeeze()
+        upsample_output = upsample_output.permute(1, 2, 0)  # CHW -> HWC
+        logits_result = transform_logits(upsample_output.data.cpu().numpy(), c, s, w, h, input_size=[512, 512])
+        parsing_result = np.argmax(logits_result, axis=2)
+        parsing_result = np.pad(parsing_result, pad_width=1, mode='constant', constant_values=0)
+        # try holefilling the clothes part
+        arm_mask = (parsing_result == 14).astype(np.float32) \
+            + (parsing_result == 15).astype(np.float32)
+        upper_cloth_mask = (parsing_result == 4).astype(np.float32) + arm_mask
+        img = np.where(upper_cloth_mask, 255, 0)
+        dst = hole_fill(img.astype(np.uint8))
+        parsing_result_filled = dst / 255 * 4
+        parsing_result_woarm = np.where(parsing_result_filled == 4, parsing_result_filled, parsing_result)
+        # add back arm and refined hole between arm and cloth
+        refine_hole_mask = refine_hole(parsing_result_filled.astype(np.uint8), parsing_result.astype(np.uint8),
+                                       arm_mask.astype(np.uint8))
+        parsing_result = np.where(refine_hole_mask, parsing_result, parsing_result_woarm)
+        # remove padding
+        parsing_result = parsing_result[1:-1, 1:-1]
 
         dataset_lip = SimpleFolderDataset(root=input_dir, input_size=[473, 473], transform=transform)
-        dataloader_lip = DataLoader(dataset_lip)
+        # dataloader_lip = DataLoader(dataset_lip)
         with torch.no_grad():
-            for _, batch in enumerate(tqdm(dataloader_lip)):
-                image, meta = batch
-                c = meta['center'].numpy()[0]
-                s = meta['scale'].numpy()[0]
-                w = meta['width'].numpy()[0]
-                h = meta['height'].numpy()[0]
+            # for _, batch in enumerate(tqdm(dataloader_lip, disable=True)):
 
-                output_lip = lip_session.run(None, {"input.1": image.numpy().astype(np.float32)})
-                upsample = torch.nn.Upsample(size=[473, 473], mode='bilinear', align_corners=True)
-                upsample_output_lip = upsample(torch.from_numpy(output_lip[1][0]).unsqueeze(0))
-                upsample_output_lip = upsample_output_lip.squeeze()
-                upsample_output_lip = upsample_output_lip.permute(1, 2, 0)  # CHW -> HWC
-                logits_result_lip = transform_logits(upsample_output_lip.data.cpu().numpy(), c, s, w, h,
-                                                     input_size=[473, 473])
-                parsing_result_lip = np.argmax(logits_result_lip, axis=2)
+            image, meta = dataset_lip[0]
+            image = image.unsqueeze(0)
+
+            # image, meta = batch
+            c = meta['center']
+            s = meta['scale']
+            w = meta['width']
+            h = meta['height']
+
+            output_lip = lip_session.run(None, {"input.1": image.numpy().astype(np.float32)})
+            upsample = torch.nn.Upsample(size=[473, 473], mode='bilinear', align_corners=True)
+            upsample_output_lip = upsample(torch.from_numpy(output_lip[1][0]).unsqueeze(0))
+            upsample_output_lip = upsample_output_lip.squeeze()
+            upsample_output_lip = upsample_output_lip.permute(1, 2, 0)  # CHW -> HWC
+            logits_result_lip = transform_logits(upsample_output_lip.data.cpu().numpy(), c, s, w, h,
+                                                 input_size=[473, 473])
+            parsing_result_lip = np.argmax(logits_result_lip, axis=2)
     # add neck parsing result
     neck_mask = np.logical_and(np.logical_not((parsing_result_lip == 13).astype(np.float32)),
                                (parsing_result == 11).astype(np.float32))
@@ -183,6 +193,3 @@ def onnx_inference(session, lip_session, input_dir):
     face_mask = torch.from_numpy((parsing_result == 11).astype(np.float32))
 
     return output_img, face_mask
-
-
-
