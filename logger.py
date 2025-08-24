@@ -1,261 +1,76 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-import atexit
-import functools
-import logging
 import os
-import sys
-import time
-from collections import Counter
+
+import numpy as np
 import torch
-from tabulate import tabulate
-from termcolor import colored
-
-from detectron2.utils.file_io import PathManager
-
-__all__ = ["setup_logger", "log_first_n", "log_every_n", "log_every_n_seconds"]
-
-D2_LOG_BUFFER_SIZE_KEY: str = "D2_LOG_BUFFER_SIZE"
-
-DEFAULT_LOG_BUFFER_SIZE: int = 1024 * 1024  # 1MB
+import torchvision
+from PIL import Image
+from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.utilities.distributed import rank_zero_only
 
 
-class _ColorfulFormatter(logging.Formatter):
-    def __init__(self, *args, **kwargs):
-        self._root_name = kwargs.pop("root_name") + "."
-        self._abbrev_name = kwargs.pop("abbrev_name", "")
-        if len(self._abbrev_name):
-            self._abbrev_name = self._abbrev_name + "."
-        super(_ColorfulFormatter, self).__init__(*args, **kwargs)
+class ImageLogger(Callback):
+    def __init__(self, batch_frequency=2000, max_images=4, clamp=True, increase_log_steps=True,
+                 rescale=True, disabled=False, log_on_batch_idx=False, log_first_step=False,
+                 log_images_kwargs=None):
+        super().__init__()
+        self.rescale = rescale
+        self.batch_freq = batch_frequency
+        self.max_images = max_images
+        if not increase_log_steps:
+            self.log_steps = [self.batch_freq]
+        self.clamp = clamp
+        self.disabled = disabled
+        self.log_on_batch_idx = log_on_batch_idx
+        self.log_images_kwargs = log_images_kwargs if log_images_kwargs else {}
+        self.log_first_step = log_first_step
 
-    def formatMessage(self, record):
-        record.name = record.name.replace(self._root_name, self._abbrev_name)
-        log = super(_ColorfulFormatter, self).formatMessage(record)
-        if record.levelno == logging.WARNING:
-            prefix = colored("WARNING", "red", attrs=["blink"])
-        elif record.levelno == logging.ERROR or record.levelno == logging.CRITICAL:
-            prefix = colored("ERROR", "red", attrs=["blink", "underline"])
-        else:
-            return log
-        return prefix + " " + log
+    @rank_zero_only
+    def log_local(self, save_dir, split, images, global_step, current_epoch, batch_idx):
+        root = os.path.join(save_dir, "image_log", split)
+        for k in images:
+            grid = torchvision.utils.make_grid(images[k], nrow=4)
+            if self.rescale:
+                grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
+            grid = grid.transpose(0, 1).transpose(1, 2).squeeze(-1)
+            grid = grid.numpy()
+            grid = (grid * 255).astype(np.uint8)
+            filename = "{}_gs-{:06}_e-{:06}_b-{:06}.png".format(k, global_step, current_epoch, batch_idx)
+            path = os.path.join(root, filename)
+            os.makedirs(os.path.split(path)[0], exist_ok=True)
+            Image.fromarray(grid).save(path)
 
+    def log_img(self, pl_module, batch, batch_idx, split="train"):
+        check_idx = batch_idx  # if self.log_on_batch_idx else pl_module.global_step
+        if (self.check_frequency(check_idx) and  # batch_idx % self.batch_freq == 0
+                hasattr(pl_module, "log_images") and
+                callable(pl_module.log_images) and
+                self.max_images > 0):
+            logger = type(pl_module.logger)
 
-@functools.lru_cache()  # so that calling setup_logger multiple times won't add many handlers
-def setup_logger(
-    output=None,
-    distributed_rank=0,
-    *,
-    color=True,
-    name="detectron2",
-    abbrev_name=None,
-    enable_propagation: bool = False,
-    configure_stdout: bool = True
-):
-    """
-    Initialize the detectron2 logger and set its verbosity level to "DEBUG".
+            is_train = pl_module.training
+            if is_train:
+                pl_module.eval()
 
-    Args:
-        output (str): a file name or a directory to save log. If None, will not save log file.
-            If ends with ".txt" or ".log", assumed to be a file name.
-            Otherwise, logs will be saved to `output/log.txt`.
-        name (str): the root module name of this logger
-        abbrev_name (str): an abbreviation of the module, to avoid long names in logs.
-            Set to "" to not log the root module in logs.
-            By default, will abbreviate "detectron2" to "d2" and leave other
-            modules unchanged.
-        enable_propagation (bool): whether to propagate logs to the parent logger.
-        configure_stdout (bool): whether to configure logging to stdout.
+            with torch.no_grad():
+                images = pl_module.log_images(batch, split=split, **self.log_images_kwargs)
 
+            for k in images:
+                N = min(images[k].shape[0], self.max_images)
+                images[k] = images[k][:N]
+                if isinstance(images[k], torch.Tensor):
+                    images[k] = images[k].detach().cpu()
+                    if self.clamp:
+                        images[k] = torch.clamp(images[k], -1., 1.)
 
-    Returns:
-        logging.Logger: a logger
-    """
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = enable_propagation
+            self.log_local(pl_module.logger.save_dir, split, images,
+                           pl_module.global_step, pl_module.current_epoch, batch_idx)
 
-    if abbrev_name is None:
-        abbrev_name = "d2" if name == "detectron2" else name
+            if is_train:
+                pl_module.train()
 
-    plain_formatter = logging.Formatter(
-        "[%(asctime)s] %(name)s %(levelname)s: %(message)s", datefmt="%m/%d %H:%M:%S"
-    )
-    # stdout logging: master only
-    if configure_stdout and distributed_rank == 0:
-        ch = logging.StreamHandler(stream=sys.stdout)
-        ch.setLevel(logging.DEBUG)
-        if color:
-            formatter = _ColorfulFormatter(
-                colored("[%(asctime)s %(name)s]: ", "green") + "%(message)s",
-                datefmt="%m/%d %H:%M:%S",
-                root_name=name,
-                abbrev_name=str(abbrev_name),
-            )
-        else:
-            formatter = plain_formatter
-        ch.setFormatter(formatter)
-        logger.addHandler(ch)
+    def check_frequency(self, check_idx):
+        return check_idx % self.batch_freq == 0
 
-    # file logging: all workers
-    if output is not None:
-        if output.endswith(".txt") or output.endswith(".log"):
-            filename = output
-        else:
-            filename = os.path.join(output, "log.txt")
-        if distributed_rank > 0:
-            filename = filename + ".rank{}".format(distributed_rank)
-        PathManager.mkdirs(os.path.dirname(filename))
-
-        fh = logging.StreamHandler(_cached_log_stream(filename))
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(plain_formatter)
-        logger.addHandler(fh)
-
-    return logger
-
-
-# cache the opened file object, so that different calls to `setup_logger`
-# with the same file name can safely write to the same file.
-@functools.lru_cache(maxsize=None)
-def _cached_log_stream(filename):
-    # use 1K buffer if writing to cloud storage
-    io = PathManager.open(filename, "a", buffering=_get_log_stream_buffer_size(filename))
-    atexit.register(io.close)
-    return io
-
-
-def _get_log_stream_buffer_size(filename: str) -> int:
-    if "://" not in filename:
-        # Local file, no extra caching is necessary
-        return -1
-    # Remote file requires a larger cache to avoid many small writes.
-    if D2_LOG_BUFFER_SIZE_KEY in os.environ:
-        return int(os.environ[D2_LOG_BUFFER_SIZE_KEY])
-    return DEFAULT_LOG_BUFFER_SIZE
-
-
-"""
-Below are some other convenient logging methods.
-They are mainly adopted from
-https://github.com/abseil/abseil-py/blob/master/absl/logging/__init__.py
-"""
-
-
-def _find_caller():
-    """
-    Returns:
-        str: module name of the caller
-        tuple: a hashable key to be used to identify different callers
-    """
-    frame = sys._getframe(2)
-    while frame:
-        code = frame.f_code
-        if os.path.join("utils", "logger.") not in code.co_filename:
-            mod_name = frame.f_globals["__name__"]
-            if mod_name == "__main__":
-                mod_name = "detectron2"
-            return mod_name, (code.co_filename, frame.f_lineno, code.co_name)
-        frame = frame.f_back
-
-
-_LOG_COUNTER = Counter()
-_LOG_TIMER = {}
-
-
-def log_first_n(lvl, msg, n=1, *, name=None, key="caller"):
-    """
-    Log only for the first n times.
-
-    Args:
-        lvl (int): the logging level
-        msg (str):
-        n (int):
-        name (str): name of the logger to use. Will use the caller's module by default.
-        key (str or tuple[str]): the string(s) can be one of "caller" or
-            "message", which defines how to identify duplicated logs.
-            For example, if called with `n=1, key="caller"`, this function
-            will only log the first call from the same caller, regardless of
-            the message content.
-            If called with `n=1, key="message"`, this function will log the
-            same content only once, even if they are called from different places.
-            If called with `n=1, key=("caller", "message")`, this function
-            will not log only if the same caller has logged the same message before.
-    """
-    if isinstance(key, str):
-        key = (key,)
-    assert len(key) > 0
-
-    caller_module, caller_key = _find_caller()
-    hash_key = ()
-    if "caller" in key:
-        hash_key = hash_key + caller_key
-    if "message" in key:
-        hash_key = hash_key + (msg,)
-
-    _LOG_COUNTER[hash_key] += 1
-    if _LOG_COUNTER[hash_key] <= n:
-        logging.getLogger(name or caller_module).log(lvl, msg)
-
-
-def log_every_n(lvl, msg, n=1, *, name=None):
-    """
-    Log once per n times.
-
-    Args:
-        lvl (int): the logging level
-        msg (str):
-        n (int):
-        name (str): name of the logger to use. Will use the caller's module by default.
-    """
-    caller_module, key = _find_caller()
-    _LOG_COUNTER[key] += 1
-    if n == 1 or _LOG_COUNTER[key] % n == 1:
-        logging.getLogger(name or caller_module).log(lvl, msg)
-
-
-def log_every_n_seconds(lvl, msg, n=1, *, name=None):
-    """
-    Log no more than once per n seconds.
-
-    Args:
-        lvl (int): the logging level
-        msg (str):
-        n (int):
-        name (str): name of the logger to use. Will use the caller's module by default.
-    """
-    caller_module, key = _find_caller()
-    last_logged = _LOG_TIMER.get(key, None)
-    current_time = time.time()
-    if last_logged is None or current_time - last_logged >= n:
-        logging.getLogger(name or caller_module).log(lvl, msg)
-        _LOG_TIMER[key] = current_time
-
-
-def create_small_table(small_dict):
-    """
-    Create a small table using the keys of small_dict as headers. This is only
-    suitable for small dictionaries.
-
-    Args:
-        small_dict (dict): a result dictionary of only a few items.
-
-    Returns:
-        str: the table as a string.
-    """
-    keys, values = tuple(zip(*small_dict.items()))
-    table = tabulate(
-        [values],
-        headers=keys,
-        tablefmt="pipe",
-        floatfmt=".3f",
-        stralign="center",
-        numalign="center",
-    )
-    return table
-
-
-def _log_api_usage(identifier: str):
-    """
-    Internal function used to log the usage of different detectron2 components
-    inside facebook's infra.
-    """
-    torch._C._log_api_usage_once("detectron2." + identifier)
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+        if not self.disabled:
+            self.log_img(pl_module, batch, batch_idx, split="train")
