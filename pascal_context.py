@@ -1,60 +1,103 @@
-# dataset settings
-dataset_type = 'PascalContextDataset'
-data_root = 'data/VOCdevkit/VOC2010/'
-img_norm_cfg = dict(
-    mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
+import os.path as osp
 
-img_scale = (520, 520)
-crop_size = (480, 480)
+from .builder import DATASETS
+from .custom import CustomDataset
 
-train_pipeline = [
-    dict(type='LoadImageFromFile'),
-    dict(type='LoadAnnotations'),
-    dict(type='Resize', img_scale=img_scale, ratio_range=(0.5, 2.0)),
-    dict(type='RandomCrop', crop_size=crop_size, cat_max_ratio=0.75),
-    dict(type='RandomFlip', prob=0.5),
-    dict(type='PhotoMetricDistortion'),
-    dict(type='Normalize', **img_norm_cfg),
-    dict(type='Pad', size=crop_size, pad_val=0, seg_pad_val=255),
-    dict(type='DefaultFormatBundle'),
-    dict(type='Collect', keys=['img', 'gt_semantic_seg']),
-]
-test_pipeline = [
-    dict(type='LoadImageFromFile'),
-    dict(
-        type='MultiScaleFlipAug',
-        img_scale=img_scale,
-        # img_ratios=[0.5, 0.75, 1.0, 1.25, 1.5, 1.75],
-        flip=False,
-        transforms=[
-            dict(type='Resize', keep_ratio=True),
-            dict(type='RandomFlip'),
-            dict(type='Normalize', **img_norm_cfg),
-            dict(type='ImageToTensor', keys=['img']),
-            dict(type='Collect', keys=['img']),
-        ])
-]
-data = dict(
-    samples_per_gpu=4,
-    workers_per_gpu=4,
-    train=dict(
-        type=dataset_type,
-        data_root=data_root,
-        img_dir='JPEGImages',
-        ann_dir='SegmentationClassContext',
-        split='ImageSets/SegmentationContext/train.txt',
-        pipeline=train_pipeline),
-    val=dict(
-        type=dataset_type,
-        data_root=data_root,
-        img_dir='JPEGImages',
-        ann_dir='SegmentationClassContext',
-        split='ImageSets/SegmentationContext/val.txt',
-        pipeline=test_pipeline),
-    test=dict(
-        type=dataset_type,
-        data_root=data_root,
-        img_dir='JPEGImages',
-        ann_dir='SegmentationClassContext',
-        split='ImageSets/SegmentationContext/val.txt',
-        pipeline=test_pipeline))
+
+@DATASETS.register_module()
+class PascalContextDataset(CustomDataset):
+    """PascalContext dataset.
+
+    In segmentation map annotation for PascalContext, 0 stands for background,
+    which is included in 60 categories. ``reduce_zero_label`` is fixed to
+    False. The ``img_suffix`` is fixed to '.jpg' and ``seg_map_suffix`` is
+    fixed to '.png'.
+
+    Args:
+        split (str): Split txt file for PascalContext.
+    """
+
+    CLASSES = ('background', 'aeroplane', 'bag', 'bed', 'bedclothes', 'bench',
+               'bicycle', 'bird', 'boat', 'book', 'bottle', 'building', 'bus',
+               'cabinet', 'car', 'cat', 'ceiling', 'chair', 'cloth',
+               'computer', 'cow', 'cup', 'curtain', 'dog', 'door', 'fence',
+               'floor', 'flower', 'food', 'grass', 'ground', 'horse',
+               'keyboard', 'light', 'motorbike', 'mountain', 'mouse', 'person',
+               'plate', 'platform', 'pottedplant', 'road', 'rock', 'sheep',
+               'shelves', 'sidewalk', 'sign', 'sky', 'snow', 'sofa', 'table',
+               'track', 'train', 'tree', 'truck', 'tvmonitor', 'wall', 'water',
+               'window', 'wood')
+
+    PALETTE = [[120, 120, 120], [180, 120, 120], [6, 230, 230], [80, 50, 50],
+               [4, 200, 3], [120, 120, 80], [140, 140, 140], [204, 5, 255],
+               [230, 230, 230], [4, 250, 7], [224, 5, 255], [235, 255, 7],
+               [150, 5, 61], [120, 120, 70], [8, 255, 51], [255, 6, 82],
+               [143, 255, 140], [204, 255, 4], [255, 51, 7], [204, 70, 3],
+               [0, 102, 200], [61, 230, 250], [255, 6, 51], [11, 102, 255],
+               [255, 7, 71], [255, 9, 224], [9, 7, 230], [220, 220, 220],
+               [255, 9, 92], [112, 9, 255], [8, 255, 214], [7, 255, 224],
+               [255, 184, 6], [10, 255, 71], [255, 41, 10], [7, 255, 255],
+               [224, 255, 8], [102, 8, 255], [255, 61, 6], [255, 194, 7],
+               [255, 122, 8], [0, 255, 20], [255, 8, 41], [255, 5, 153],
+               [6, 51, 255], [235, 12, 255], [160, 150, 20], [0, 163, 255],
+               [140, 140, 140], [250, 10, 15], [20, 255, 0], [31, 255, 0],
+               [255, 31, 0], [255, 224, 0], [153, 255, 0], [0, 0, 255],
+               [255, 71, 0], [0, 235, 255], [0, 173, 255], [31, 0, 255]]
+
+    def __init__(self, split, **kwargs):
+        super(PascalContextDataset, self).__init__(
+            img_suffix='.jpg',
+            seg_map_suffix='.png',
+            split=split,
+            reduce_zero_label=False,
+            **kwargs)
+        assert osp.exists(self.img_dir) and self.split is not None
+
+
+@DATASETS.register_module()
+class PascalContextDataset59(CustomDataset):
+    """PascalContext dataset.
+
+    In segmentation map annotation for PascalContext, 0 stands for background,
+    which is included in 60 categories. ``reduce_zero_label`` is fixed to
+    False. The ``img_suffix`` is fixed to '.jpg' and ``seg_map_suffix`` is
+    fixed to '.png'.
+
+    Args:
+        split (str): Split txt file for PascalContext.
+    """
+
+    CLASSES = ('aeroplane', 'bag', 'bed', 'bedclothes', 'bench', 'bicycle',
+               'bird', 'boat', 'book', 'bottle', 'building', 'bus', 'cabinet',
+               'car', 'cat', 'ceiling', 'chair', 'cloth', 'computer', 'cow',
+               'cup', 'curtain', 'dog', 'door', 'fence', 'floor', 'flower',
+               'food', 'grass', 'ground', 'horse', 'keyboard', 'light',
+               'motorbike', 'mountain', 'mouse', 'person', 'plate', 'platform',
+               'pottedplant', 'road', 'rock', 'sheep', 'shelves', 'sidewalk',
+               'sign', 'sky', 'snow', 'sofa', 'table', 'track', 'train',
+               'tree', 'truck', 'tvmonitor', 'wall', 'water', 'window', 'wood')
+
+    PALETTE = [[180, 120, 120], [6, 230, 230], [80, 50, 50], [4, 200, 3],
+               [120, 120, 80], [140, 140, 140], [204, 5, 255], [230, 230, 230],
+               [4, 250, 7], [224, 5, 255], [235, 255, 7], [150, 5, 61],
+               [120, 120, 70], [8, 255, 51], [255, 6, 82], [143, 255, 140],
+               [204, 255, 4], [255, 51, 7], [204, 70, 3], [0, 102, 200],
+               [61, 230, 250], [255, 6, 51], [11, 102, 255], [255, 7, 71],
+               [255, 9, 224], [9, 7, 230], [220, 220, 220], [255, 9, 92],
+               [112, 9, 255], [8, 255, 214], [7, 255, 224], [255, 184, 6],
+               [10, 255, 71], [255, 41, 10], [7, 255, 255], [224, 255, 8],
+               [102, 8, 255], [255, 61, 6], [255, 194, 7], [255, 122, 8],
+               [0, 255, 20], [255, 8, 41], [255, 5, 153], [6, 51, 255],
+               [235, 12, 255], [160, 150, 20], [0, 163, 255], [140, 140, 140],
+               [250, 10, 15], [20, 255, 0], [31, 255, 0], [255, 31, 0],
+               [255, 224, 0], [153, 255, 0], [0, 0, 255], [255, 71, 0],
+               [0, 235, 255], [0, 173, 255], [31, 0, 255]]
+
+    def __init__(self, split, **kwargs):
+        super(PascalContextDataset59, self).__init__(
+            img_suffix='.jpg',
+            seg_map_suffix='.png',
+            split=split,
+            reduce_zero_label=True,
+            **kwargs)
+        assert osp.exists(self.img_dir) and self.split is not None

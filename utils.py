@@ -1,93 +1,121 @@
-# Copyright (c) OpenMMLab. All rights reserved.
-import os
-import random
-import sys
-import time
-import warnings
-from getpass import getuser
-from socket import gethostname
-
-import numpy as np
-import torch
+import functools
 
 import annotator.uniformer.mmcv as mmcv
+import numpy as np
+import torch.nn.functional as F
 
 
-def get_host_info():
-    """Get hostname and username.
-
-    Return empty string if exception raised, e.g. ``getpass.getuser()`` will
-    lead to error in docker container
-    """
-    host = ''
-    try:
-        host = f'{getuser()}@{gethostname()}'
-    except Exception as e:
-        warnings.warn(f'Host or user not found: {str(e)}')
-    finally:
-        return host
-
-
-def get_time_str():
-    return time.strftime('%Y%m%d_%H%M%S', time.localtime())
-
-
-def obj_from_dict(info, parent=None, default_args=None):
-    """Initialize an object from dict.
-
-    The dict must contain the key "type", which indicates the object type, it
-    can be either a string or type, such as "list" or ``list``. Remaining
-    fields are treated as the arguments for constructing the object.
+def get_class_weight(class_weight):
+    """Get class weight for loss function.
 
     Args:
-        info (dict): Object types and arguments.
-        parent (:class:`module`): Module which may containing expected object
-            classes.
-        default_args (dict, optional): Default arguments for initializing the
-            object.
+        class_weight (list[float] | str | None): If class_weight is a str,
+            take it as a file name and read from it.
+    """
+    if isinstance(class_weight, str):
+        # take it as a file path
+        if class_weight.endswith('.npy'):
+            class_weight = np.load(class_weight)
+        else:
+            # pkl, json or yaml
+            class_weight = mmcv.load(class_weight)
+
+    return class_weight
+
+
+def reduce_loss(loss, reduction):
+    """Reduce loss as specified.
+
+    Args:
+        loss (Tensor): Elementwise loss tensor.
+        reduction (str): Options are "none", "mean" and "sum".
+
+    Return:
+        Tensor: Reduced loss tensor.
+    """
+    reduction_enum = F._Reduction.get_enum(reduction)
+    # none: 0, elementwise_mean:1, sum: 2
+    if reduction_enum == 0:
+        return loss
+    elif reduction_enum == 1:
+        return loss.mean()
+    elif reduction_enum == 2:
+        return loss.sum()
+
+
+def weight_reduce_loss(loss, weight=None, reduction='mean', avg_factor=None):
+    """Apply element-wise weight and reduce loss.
+
+    Args:
+        loss (Tensor): Element-wise loss.
+        weight (Tensor): Element-wise weights.
+        reduction (str): Same as built-in losses of PyTorch.
+        avg_factor (float): Avarage factor when computing the mean of losses.
 
     Returns:
-        any type: Object built from the dict.
+        Tensor: Processed loss values.
     """
-    assert isinstance(info, dict) and 'type' in info
-    assert isinstance(default_args, dict) or default_args is None
-    args = info.copy()
-    obj_type = args.pop('type')
-    if mmcv.is_str(obj_type):
-        if parent is not None:
-            obj_type = getattr(parent, obj_type)
-        else:
-            obj_type = sys.modules[obj_type]
-    elif not isinstance(obj_type, type):
-        raise TypeError('type must be a str or valid type, but '
-                        f'got {type(obj_type)}')
-    if default_args is not None:
-        for name, value in default_args.items():
-            args.setdefault(name, value)
-    return obj_type(**args)
+    # if weight is specified, apply element-wise weight
+    if weight is not None:
+        assert weight.dim() == loss.dim()
+        if weight.dim() > 1:
+            assert weight.size(1) == 1 or weight.size(1) == loss.size(1)
+        loss = loss * weight
+
+    # if avg_factor is not specified, just reduce the loss
+    if avg_factor is None:
+        loss = reduce_loss(loss, reduction)
+    else:
+        # if reduction is mean, then average the loss by avg_factor
+        if reduction == 'mean':
+            loss = loss.sum() / avg_factor
+        # if reduction is 'none', then do nothing, otherwise raise an error
+        elif reduction != 'none':
+            raise ValueError('avg_factor can not be used with reduction="sum"')
+    return loss
 
 
-def set_random_seed(seed, deterministic=False, use_rank_shift=False):
-    """Set random seed.
+def weighted_loss(loss_func):
+    """Create a weighted version of a given loss function.
 
-    Args:
-        seed (int): Seed to be used.
-        deterministic (bool): Whether to set the deterministic option for
-            CUDNN backend, i.e., set `torch.backends.cudnn.deterministic`
-            to True and `torch.backends.cudnn.benchmark` to False.
-            Default: False.
-        rank_shift (bool): Whether to add rank number to the random seed to
-            have different random seed in different threads. Default: False.
+    To use this decorator, the loss function must have the signature like
+    `loss_func(pred, target, **kwargs)`. The function only needs to compute
+    element-wise loss without any reduction. This decorator will add weight
+    and reduction arguments to the function. The decorated function will have
+    the signature like `loss_func(pred, target, weight=None, reduction='mean',
+    avg_factor=None, **kwargs)`.
+
+    :Example:
+
+    >>> import torch
+    >>> @weighted_loss
+    >>> def l1_loss(pred, target):
+    >>>     return (pred - target).abs()
+
+    >>> pred = torch.Tensor([0, 2, 3])
+    >>> target = torch.Tensor([1, 1, 1])
+    >>> weight = torch.Tensor([1, 0, 1])
+
+    >>> l1_loss(pred, target)
+    tensor(1.3333)
+    >>> l1_loss(pred, target, weight)
+    tensor(1.)
+    >>> l1_loss(pred, target, reduction='none')
+    tensor([1., 1., 2.])
+    >>> l1_loss(pred, target, weight, avg_factor=2)
+    tensor(1.5000)
     """
-    if use_rank_shift:
-        rank, _ = mmcv.runner.get_dist_info()
-        seed += rank
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    if deterministic:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+
+    @functools.wraps(loss_func)
+    def wrapper(pred,
+                target,
+                weight=None,
+                reduction='mean',
+                avg_factor=None,
+                **kwargs):
+        # get element-wise loss
+        loss = loss_func(pred, target, **kwargs)
+        loss = weight_reduce_loss(loss, weight, reduction, avg_factor)
+        return loss
+
+    return wrapper
