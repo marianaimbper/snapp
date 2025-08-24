@@ -1,8 +1,3 @@
-from pathlib import Path
-import sys
-PROJECT_ROOT = Path(__file__).absolute().parents[3].absolute()
-# print(PROJECT_ROOT)
-
 import cv2
 import numpy as np
 import math
@@ -16,17 +11,15 @@ from torchvision import transforms
 from . import util
 from .model import bodypose_model
 
-
 class Body(object):
     def __init__(self, model_path):
         self.model = bodypose_model()
         if torch.cuda.is_available():
             self.model = self.model.cuda()
-            # print('cuda')
+            print('cuda')
         model_dict = util.transfer(self.model, torch.load(model_path))
         self.model.load_state_dict(model_dict)
         self.model.eval()
-
 
     def __call__(self, oriImg):
         # scale_search = [0.5, 1.0, 1.5, 2.0]
@@ -42,7 +35,7 @@ class Body(object):
 
         for m in range(len(multiplier)):
             scale = multiplier[m]
-            imageToTest = util.smart_resize_k(oriImg, fx=scale, fy=scale)
+            imageToTest = cv2.resize(oriImg, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
             imageToTest_padded, pad = util.padRightDownCorner(imageToTest, stride, padValue)
             im = np.transpose(np.float32(imageToTest_padded[:, :, :, np.newaxis]), (3, 2, 0, 1)) / 256 - 0.5
             im = np.ascontiguousarray(im)
@@ -53,22 +46,21 @@ class Body(object):
             # data = data.permute([2, 0, 1]).unsqueeze(0).float()
             with torch.no_grad():
                 Mconv7_stage6_L1, Mconv7_stage6_L2 = self.model(data)
-
             Mconv7_stage6_L1 = Mconv7_stage6_L1.cpu().numpy()
             Mconv7_stage6_L2 = Mconv7_stage6_L2.cpu().numpy()
 
             # extract outputs, resize, and remove padding
             # heatmap = np.transpose(np.squeeze(net.blobs[output_blobs.keys()[1]].data), (1, 2, 0))  # output 1 is heatmaps
             heatmap = np.transpose(np.squeeze(Mconv7_stage6_L2), (1, 2, 0))  # output 1 is heatmaps
-            heatmap = util.smart_resize_k(heatmap, fx=stride, fy=stride)
+            heatmap = cv2.resize(heatmap, (0, 0), fx=stride, fy=stride, interpolation=cv2.INTER_CUBIC)
             heatmap = heatmap[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
-            heatmap = util.smart_resize(heatmap, (oriImg.shape[0], oriImg.shape[1]))
+            heatmap = cv2.resize(heatmap, (oriImg.shape[1], oriImg.shape[0]), interpolation=cv2.INTER_CUBIC)
 
             # paf = np.transpose(np.squeeze(net.blobs[output_blobs.keys()[0]].data), (1, 2, 0))  # output 0 is PAFs
             paf = np.transpose(np.squeeze(Mconv7_stage6_L1), (1, 2, 0))  # output 0 is PAFs
-            paf = util.smart_resize_k(paf, fx=stride, fy=stride)
+            paf = cv2.resize(paf, (0, 0), fx=stride, fy=stride, interpolation=cv2.INTER_CUBIC)
             paf = paf[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
-            paf = util.smart_resize(paf, (oriImg.shape[0], oriImg.shape[1]))
+            paf = cv2.resize(paf, (oriImg.shape[1], oriImg.shape[0]), interpolation=cv2.INTER_CUBIC)
 
             heatmap_avg += heatmap_avg + heatmap / len(multiplier)
             paf_avg += + paf / len(multiplier)
@@ -90,8 +82,7 @@ class Body(object):
             map_down[:, :-1] = one_heatmap[:, 1:]
 
             peaks_binary = np.logical_and.reduce(
-                (one_heatmap >= map_left, one_heatmap >= map_right, one_heatmap >= map_up, one_heatmap >= map_down,
-                 one_heatmap > thre1))
+                (one_heatmap >= map_left, one_heatmap >= map_right, one_heatmap >= map_up, one_heatmap >= map_down, one_heatmap > thre1))
             peaks = list(zip(np.nonzero(peaks_binary)[1], np.nonzero(peaks_binary)[0]))  # note reverse
             peaks_with_score = [x + (map_ori[x[1], x[0]],) for x in peaks]
             peak_id = range(peak_counter, peak_counter + len(peaks))
@@ -217,13 +208,12 @@ class Body(object):
         # candidate: x, y, score, id
         return candidate, subset
 
+if __name__ == "__main__":
+    body_estimation = Body('../model/body_pose_model.pth')
 
-# if __name__ == "__main__":
-#     body_estimation = Body('../model/body_pose_model.pth')
-
-#     test_image = '../images/ski.jpg'
-#     oriImg = cv2.imread(test_image)  # B,G,R order
-#     candidate, subset = body_estimation(oriImg)
-#     canvas = util.draw_bodypose(oriImg, candidate, subset)
-#     plt.imshow(canvas[:, :, [2, 1, 0]])
-#     plt.show()
+    test_image = '../images/ski.jpg'
+    oriImg = cv2.imread(test_image)  # B,G,R order
+    candidate, subset = body_estimation(oriImg)
+    canvas = util.draw_bodypose(oriImg, candidate, subset)
+    plt.imshow(canvas[:, :, [2, 1, 0]])
+    plt.show()

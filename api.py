@@ -1,22 +1,26 @@
 # based on https://github.com/isl-org/MiDaS
 
 import cv2
+import os
 import torch
 import torch.nn as nn
 from torchvision.transforms import Compose
 
-from ldm.modules.midas.midas.dpt_depth import DPTDepthModel
-from ldm.modules.midas.midas.midas_net import MidasNet
-from ldm.modules.midas.midas.midas_net_custom import MidasNet_small
-from ldm.modules.midas.midas.transforms import Resize, NormalizeImage, PrepareForNet
+from .midas.dpt_depth import DPTDepthModel
+from .midas.midas_net import MidasNet
+from .midas.midas_net_custom import MidasNet_small
+from .midas.transforms import Resize, NormalizeImage, PrepareForNet
+from annotator.util import annotator_ckpts_path
 
 
 ISL_PATHS = {
-    "dpt_large": "midas_models/dpt_large-midas-2f21e586.pt",
-    "dpt_hybrid": "midas_models/dpt_hybrid-midas-501f0c75.pt",
+    "dpt_large": os.path.join(annotator_ckpts_path, "dpt_large-midas-2f21e586.pt"),
+    "dpt_hybrid": os.path.join(annotator_ckpts_path, "dpt_hybrid-midas-501f0c75.pt"),
     "midas_v21": "",
     "midas_v21_small": "",
 }
+
+remote_model_path = "https://huggingface.co/lllyasviel/ControlNet/resolve/main/annotator/ckpts/dpt_hybrid-midas-501f0c75.pt"
 
 
 def disabled_train(self, mode=True):
@@ -85,6 +89,10 @@ def load_model(model_type):
         normalization = NormalizeImage(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
     elif model_type == "dpt_hybrid":  # DPT-Hybrid
+        if not os.path.exists(model_path):
+            from basicsr.utils.download_util import load_file_from_url
+            load_file_from_url(remote_model_path, model_dir=annotator_ckpts_path)
+
         model = DPTDepthModel(
             path=model_path,
             backbone="vitb_rn50_384",
@@ -155,16 +163,7 @@ class MiDaSInference(nn.Module):
         self.model.train = disabled_train
 
     def forward(self, x):
-        # x in 0..1 as produced by calling self.transform on a 0..1 float64 numpy array
-        # NOTE: we expect that the correct transform has been called during dataloading.
         with torch.no_grad():
             prediction = self.model(x)
-            prediction = torch.nn.functional.interpolate(
-                prediction.unsqueeze(1),
-                size=x.shape[2:],
-                mode="bicubic",
-                align_corners=False,
-            )
-        assert prediction.shape == (x.shape[0], 1, x.shape[2], x.shape[3])
         return prediction
 

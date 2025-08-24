@@ -1,167 +1,234 @@
-# ------------------------------------------------------------------------------
-# Copyright (c) Microsoft
-# Licensed under the MIT License.
-# Written by Bin Xiao (Bin.Xiao@microsoft.com)
-# ------------------------------------------------------------------------------
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import numpy as np
 import cv2
-import torch
+import math
 
-class BRG2Tensor_transform(object):
-    def __call__(self, pic):
-        img = torch.from_numpy(pic.transpose((2, 0, 1)))
-        if isinstance(img, torch.ByteTensor):
-            return img.float()
+
+def apply_min_size(sample, size, image_interpolation_method=cv2.INTER_AREA):
+    """Rezise the sample to ensure the given size. Keeps aspect ratio.
+
+    Args:
+        sample (dict): sample
+        size (tuple): image size
+
+    Returns:
+        tuple: new size
+    """
+    shape = list(sample["disparity"].shape)
+
+    if shape[0] >= size[0] and shape[1] >= size[1]:
+        return sample
+
+    scale = [0, 0]
+    scale[0] = size[0] / shape[0]
+    scale[1] = size[1] / shape[1]
+
+    scale = max(scale)
+
+    shape[0] = math.ceil(scale * shape[0])
+    shape[1] = math.ceil(scale * shape[1])
+
+    # resize
+    sample["image"] = cv2.resize(
+        sample["image"], tuple(shape[::-1]), interpolation=image_interpolation_method
+    )
+
+    sample["disparity"] = cv2.resize(
+        sample["disparity"], tuple(shape[::-1]), interpolation=cv2.INTER_NEAREST
+    )
+    sample["mask"] = cv2.resize(
+        sample["mask"].astype(np.float32),
+        tuple(shape[::-1]),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    sample["mask"] = sample["mask"].astype(bool)
+
+    return tuple(shape)
+
+
+class Resize(object):
+    """Resize sample to given size (width, height).
+    """
+
+    def __init__(
+        self,
+        width,
+        height,
+        resize_target=True,
+        keep_aspect_ratio=False,
+        ensure_multiple_of=1,
+        resize_method="lower_bound",
+        image_interpolation_method=cv2.INTER_AREA,
+    ):
+        """Init.
+
+        Args:
+            width (int): desired output width
+            height (int): desired output height
+            resize_target (bool, optional):
+                True: Resize the full sample (image, mask, target).
+                False: Resize image only.
+                Defaults to True.
+            keep_aspect_ratio (bool, optional):
+                True: Keep the aspect ratio of the input sample.
+                Output sample might not have the given width and height, and
+                resize behaviour depends on the parameter 'resize_method'.
+                Defaults to False.
+            ensure_multiple_of (int, optional):
+                Output width and height is constrained to be multiple of this parameter.
+                Defaults to 1.
+            resize_method (str, optional):
+                "lower_bound": Output will be at least as large as the given size.
+                "upper_bound": Output will be at max as large as the given size. (Output size might be smaller than given size.)
+                "minimal": Scale as least as possible.  (Output size might be smaller than given size.)
+                Defaults to "lower_bound".
+        """
+        self.__width = width
+        self.__height = height
+
+        self.__resize_target = resize_target
+        self.__keep_aspect_ratio = keep_aspect_ratio
+        self.__multiple_of = ensure_multiple_of
+        self.__resize_method = resize_method
+        self.__image_interpolation_method = image_interpolation_method
+
+    def constrain_to_multiple_of(self, x, min_val=0, max_val=None):
+        y = (np.round(x / self.__multiple_of) * self.__multiple_of).astype(int)
+
+        if max_val is not None and y > max_val:
+            y = (np.floor(x / self.__multiple_of) * self.__multiple_of).astype(int)
+
+        if y < min_val:
+            y = (np.ceil(x / self.__multiple_of) * self.__multiple_of).astype(int)
+
+        return y
+
+    def get_size(self, width, height):
+        # determine new height and width
+        scale_height = self.__height / height
+        scale_width = self.__width / width
+
+        if self.__keep_aspect_ratio:
+            if self.__resize_method == "lower_bound":
+                # scale such that output size is lower bound
+                if scale_width > scale_height:
+                    # fit width
+                    scale_height = scale_width
+                else:
+                    # fit height
+                    scale_width = scale_height
+            elif self.__resize_method == "upper_bound":
+                # scale such that output size is upper bound
+                if scale_width < scale_height:
+                    # fit width
+                    scale_height = scale_width
+                else:
+                    # fit height
+                    scale_width = scale_height
+            elif self.__resize_method == "minimal":
+                # scale as least as possbile
+                if abs(1 - scale_width) < abs(1 - scale_height):
+                    # fit width
+                    scale_height = scale_width
+                else:
+                    # fit height
+                    scale_width = scale_height
+            else:
+                raise ValueError(
+                    f"resize_method {self.__resize_method} not implemented"
+                )
+
+        if self.__resize_method == "lower_bound":
+            new_height = self.constrain_to_multiple_of(
+                scale_height * height, min_val=self.__height
+            )
+            new_width = self.constrain_to_multiple_of(
+                scale_width * width, min_val=self.__width
+            )
+        elif self.__resize_method == "upper_bound":
+            new_height = self.constrain_to_multiple_of(
+                scale_height * height, max_val=self.__height
+            )
+            new_width = self.constrain_to_multiple_of(
+                scale_width * width, max_val=self.__width
+            )
+        elif self.__resize_method == "minimal":
+            new_height = self.constrain_to_multiple_of(scale_height * height)
+            new_width = self.constrain_to_multiple_of(scale_width * width)
         else:
-            return img
+            raise ValueError(f"resize_method {self.__resize_method} not implemented")
 
-class BGR2RGB_transform(object):
-    def __call__(self, tensor):
-        return tensor[[2,1,0],:,:]
+        return (new_width, new_height)
 
-def flip_back(output_flipped, matched_parts):
-    '''
-    ouput_flipped: numpy.ndarray(batch_size, num_joints, height, width)
-    '''
-    assert output_flipped.ndim == 4,\
-        'output_flipped should be [batch_size, num_joints, height, width]'
+    def __call__(self, sample):
+        width, height = self.get_size(
+            sample["image"].shape[1], sample["image"].shape[0]
+        )
 
-    output_flipped = output_flipped[:, :, :, ::-1]
+        # resize sample
+        sample["image"] = cv2.resize(
+            sample["image"],
+            (width, height),
+            interpolation=self.__image_interpolation_method,
+        )
 
-    for pair in matched_parts:
-        tmp = output_flipped[:, pair[0], :, :].copy()
-        output_flipped[:, pair[0], :, :] = output_flipped[:, pair[1], :, :]
-        output_flipped[:, pair[1], :, :] = tmp
+        if self.__resize_target:
+            if "disparity" in sample:
+                sample["disparity"] = cv2.resize(
+                    sample["disparity"],
+                    (width, height),
+                    interpolation=cv2.INTER_NEAREST,
+                )
 
-    return output_flipped
+            if "depth" in sample:
+                sample["depth"] = cv2.resize(
+                    sample["depth"], (width, height), interpolation=cv2.INTER_NEAREST
+                )
+
+            sample["mask"] = cv2.resize(
+                sample["mask"].astype(np.float32),
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            sample["mask"] = sample["mask"].astype(bool)
+
+        return sample
 
 
-def fliplr_joints(joints, joints_vis, width, matched_parts):
+class NormalizeImage(object):
+    """Normlize image by given mean and std.
     """
-    flip coords
+
+    def __init__(self, mean, std):
+        self.__mean = mean
+        self.__std = std
+
+    def __call__(self, sample):
+        sample["image"] = (sample["image"] - self.__mean) / self.__std
+
+        return sample
+
+
+class PrepareForNet(object):
+    """Prepare sample for usage as network input.
     """
-    # Flip horizontal
-    joints[:, 0] = width - joints[:, 0] - 1
 
-    # Change left-right parts
-    for pair in matched_parts:
-        joints[pair[0], :], joints[pair[1], :] = \
-            joints[pair[1], :], joints[pair[0], :].copy()
-        joints_vis[pair[0], :], joints_vis[pair[1], :] = \
-            joints_vis[pair[1], :], joints_vis[pair[0], :].copy()
+    def __init__(self):
+        pass
 
-    return joints*joints_vis, joints_vis
+    def __call__(self, sample):
+        image = np.transpose(sample["image"], (2, 0, 1))
+        sample["image"] = np.ascontiguousarray(image).astype(np.float32)
 
+        if "mask" in sample:
+            sample["mask"] = sample["mask"].astype(np.float32)
+            sample["mask"] = np.ascontiguousarray(sample["mask"])
 
-def transform_preds(coords, center, scale, input_size):
-    target_coords = np.zeros(coords.shape)
-    trans = get_affine_transform(center, scale, 0, input_size, inv=1)
-    for p in range(coords.shape[0]):
-        target_coords[p, 0:2] = affine_transform(coords[p, 0:2], trans)
-    return target_coords
+        if "disparity" in sample:
+            disparity = sample["disparity"].astype(np.float32)
+            sample["disparity"] = np.ascontiguousarray(disparity)
 
-def transform_parsing(pred, center, scale, width, height, input_size):
+        if "depth" in sample:
+            depth = sample["depth"].astype(np.float32)
+            sample["depth"] = np.ascontiguousarray(depth)
 
-    trans = get_affine_transform(center, scale, 0, input_size, inv=1)
-    target_pred = cv2.warpAffine(
-            pred,
-            trans,
-            (int(width), int(height)), #(int(width), int(height)),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0))
-
-    return target_pred
-
-def transform_logits(logits, center, scale, width, height, input_size):
-
-    trans = get_affine_transform(center, scale, 0, input_size, inv=1)
-    channel = logits.shape[2]
-    target_logits = []
-    for i in range(channel):
-        target_logit = cv2.warpAffine(
-            logits[:,:,i],
-            trans,
-            (int(width), int(height)), #(int(width), int(height)),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0))
-        target_logits.append(target_logit)
-    target_logits = np.stack(target_logits,axis=2)
-
-    return target_logits
-
-
-def get_affine_transform(center,
-                         scale,
-                         rot,
-                         output_size,
-                         shift=np.array([0, 0], dtype=np.float32),
-                         inv=0):
-    if not isinstance(scale, np.ndarray) and not isinstance(scale, list):
-        print(scale)
-        scale = np.array([scale, scale])
-
-    scale_tmp = scale
-
-    src_w = scale_tmp[0]
-    dst_w = output_size[1]
-    dst_h = output_size[0]
-
-    rot_rad = np.pi * rot / 180
-    src_dir = get_dir([0, src_w * -0.5], rot_rad)
-    dst_dir = np.array([0, (dst_w-1) * -0.5], np.float32)
-
-    src = np.zeros((3, 2), dtype=np.float32)
-    dst = np.zeros((3, 2), dtype=np.float32)
-    src[0, :] = center + scale_tmp * shift
-    src[1, :] = center + src_dir + scale_tmp * shift
-    dst[0, :] = [(dst_w-1) * 0.5, (dst_h-1) * 0.5]
-    dst[1, :] = np.array([(dst_w-1) * 0.5, (dst_h-1) * 0.5]) + dst_dir
-
-    src[2:, :] = get_3rd_point(src[0, :], src[1, :])
-    dst[2:, :] = get_3rd_point(dst[0, :], dst[1, :])
-
-    if inv:
-        trans = cv2.getAffineTransform(np.float32(dst), np.float32(src))
-    else:
-        trans = cv2.getAffineTransform(np.float32(src), np.float32(dst))
-
-    return trans
-
-
-def affine_transform(pt, t):
-    new_pt = np.array([pt[0], pt[1], 1.]).T
-    new_pt = np.dot(t, new_pt)
-    return new_pt[:2]
-
-
-def get_3rd_point(a, b):
-    direct = a - b
-    return b + np.array([-direct[1], direct[0]], dtype=np.float32)
-
-
-def get_dir(src_point, rot_rad):
-    sn, cs = np.sin(rot_rad), np.cos(rot_rad)
-
-    src_result = [0, 0]
-    src_result[0] = src_point[0] * cs - src_point[1] * sn
-    src_result[1] = src_point[0] * sn + src_point[1] * cs
-
-    return src_result
-
-
-def crop(img, center, scale, output_size, rot=0):
-    trans = get_affine_transform(center, scale, rot, output_size)
-
-    dst_img = cv2.warpAffine(img,
-                             trans,
-                             (int(output_size[1]), int(output_size[0])),
-                             flags=cv2.INTER_LINEAR)
-
-    return dst_img
+        return sample
