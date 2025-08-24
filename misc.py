@@ -1,44 +1,17 @@
-# Copyright (c) OpenMMLab. All rights reserved.
-import numpy as np
-
-import annotator.uniformer.mmcv as mmcv
-
-try:
-    import torch
-except ImportError:
-    torch = None
-
-
-def tensor2imgs(tensor, mean=(0, 0, 0), std=(1, 1, 1), to_rgb=True):
-    """Convert tensor to 3-channel images.
+def add_prefix(inputs, prefix):
+    """Add prefix for dict.
 
     Args:
-        tensor (torch.Tensor): Tensor that contains multiple images, shape (
-            N, C, H, W).
-        mean (tuple[float], optional): Mean of images. Defaults to (0, 0, 0).
-        std (tuple[float], optional): Standard deviation of images.
-            Defaults to (1, 1, 1).
-        to_rgb (bool, optional): Whether the tensor was converted to RGB
-            format in the first place. If so, convert it back to BGR.
-            Defaults to True.
+        inputs (dict): The input dict with str keys.
+        prefix (str): The prefix to add.
 
     Returns:
-        list[np.ndarray]: A list that contains multiple images.
+
+        dict: The dict with keys updated with ``prefix``.
     """
 
-    if torch is None:
-        raise RuntimeError('pytorch is not installed')
-    assert torch.is_tensor(tensor) and tensor.ndim == 4
-    assert len(mean) == 3
-    assert len(std) == 3
+    outputs = dict()
+    for name, value in inputs.items():
+        outputs[f'{prefix}.{name}'] = value
 
-    num_imgs = tensor.size(0)
-    mean = np.array(mean, dtype=np.float32)
-    std = np.array(std, dtype=np.float32)
-    imgs = []
-    for img_id in range(num_imgs):
-        img = tensor[img_id, ...].cpu().numpy().transpose(1, 2, 0)
-        img = mmcv.imdenormalize(
-            img, mean, std, to_bgr=to_rgb).astype(np.uint8)
-        imgs.append(np.ascontiguousarray(img))
-    return imgs
+    return outputs
