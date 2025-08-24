@@ -1,83 +1,112 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-import math
-from functools import lru_cache
+# Copyright (c) OpenMMLab. All rights reserved.
+from typing import Tuple, Union
+
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
-from torch.nn.modules.utils import _pair
-from torchvision.ops import deform_conv2d
+from torch.nn.modules.utils import _pair, _single
 
-from detectron2.utils.develop import create_dummy_class, create_dummy_func
+from annotator.uniformer.mmcv.utils import deprecated_api_warning
+from ..cnn import CONV_LAYERS
+from ..utils import ext_loader, print_log
 
-from .wrappers import _NewEmptyTensorOp
+ext_module = ext_loader.load_ext('_ext', [
+    'deform_conv_forward', 'deform_conv_backward_input',
+    'deform_conv_backward_parameters'
+])
 
 
-class _DeformConv(Function):
+class DeformConv2dFunction(Function):
+
     @staticmethod
-    def forward(
-        ctx,
-        input,
-        offset,
-        weight,
-        stride=1,
-        padding=0,
-        dilation=1,
-        groups=1,
-        deformable_groups=1,
-        im2col_step=64,
-    ):
+    def symbolic(g,
+                 input,
+                 offset,
+                 weight,
+                 stride,
+                 padding,
+                 dilation,
+                 groups,
+                 deform_groups,
+                 bias=False,
+                 im2col_step=32):
+        return g.op(
+            'mmcv::MMCVDeformConv2d',
+            input,
+            offset,
+            weight,
+            stride_i=stride,
+            padding_i=padding,
+            dilation_i=dilation,
+            groups_i=groups,
+            deform_groups_i=deform_groups,
+            bias_i=bias,
+            im2col_step_i=im2col_step)
+
+    @staticmethod
+    def forward(ctx,
+                input,
+                offset,
+                weight,
+                stride=1,
+                padding=0,
+                dilation=1,
+                groups=1,
+                deform_groups=1,
+                bias=False,
+                im2col_step=32):
         if input is not None and input.dim() != 4:
             raise ValueError(
-                "Expected 4D tensor as input, got {}D tensor instead.".format(input.dim())
-            )
+                f'Expected 4D tensor as input, got {input.dim()}D tensor \
+                  instead.')
+        assert bias is False, 'Only support bias is False.'
         ctx.stride = _pair(stride)
         ctx.padding = _pair(padding)
         ctx.dilation = _pair(dilation)
         ctx.groups = groups
-        ctx.deformable_groups = deformable_groups
+        ctx.deform_groups = deform_groups
         ctx.im2col_step = im2col_step
 
+        # When pytorch version >= 1.6.0, amp is adopted for fp16 mode;
+        # amp won't cast the type of model (float32), but "offset" is cast
+        # to float16 by nn.Conv2d automatically, leading to the type
+        # mismatch with input (when it is float32) or weight.
+        # The flag for whether to use fp16 or amp is the type of "offset",
+        # we cast weight and input to temporarily support fp16 and amp
+        # whatever the pytorch version is.
+        input = input.type_as(offset)
+        weight = weight.type_as(input)
         ctx.save_for_backward(input, offset, weight)
 
         output = input.new_empty(
-            _DeformConv._output_size(input, weight, ctx.padding, ctx.dilation, ctx.stride)
-        )
+            DeformConv2dFunction._output_size(ctx, input, weight))
 
         ctx.bufs_ = [input.new_empty(0), input.new_empty(0)]  # columns, ones
 
-        if not input.is_cuda:
-            # TODO: let torchvision support full features of our deformconv.
-            if deformable_groups != 1:
-                raise NotImplementedError(
-                    "Deformable Conv with deformable_groups != 1 is not supported on CPUs!"
-                )
-            return deform_conv2d(
-                input, offset, weight, stride=stride, padding=padding, dilation=dilation
-            )
-        else:
-            cur_im2col_step = _DeformConv._cal_im2col_step(input.shape[0], ctx.im2col_step)
-            assert (input.shape[0] % cur_im2col_step) == 0, "im2col step must divide batchsize"
-
-            _C.deform_conv_forward(
-                input,
-                weight,
-                offset,
-                output,
-                ctx.bufs_[0],
-                ctx.bufs_[1],
-                weight.size(3),
-                weight.size(2),
-                ctx.stride[1],
-                ctx.stride[0],
-                ctx.padding[1],
-                ctx.padding[0],
-                ctx.dilation[1],
-                ctx.dilation[0],
-                ctx.groups,
-                ctx.deformable_groups,
-                cur_im2col_step,
-            )
+        cur_im2col_step = min(ctx.im2col_step, input.size(0))
+        assert (input.size(0) %
+                cur_im2col_step) == 0, 'im2col step must divide batchsize'
+        ext_module.deform_conv_forward(
+            input,
+            weight,
+            offset,
+            output,
+            ctx.bufs_[0],
+            ctx.bufs_[1],
+            kW=weight.size(3),
+            kH=weight.size(2),
+            dW=ctx.stride[1],
+            dH=ctx.stride[0],
+            padW=ctx.padding[1],
+            padH=ctx.padding[0],
+            dilationW=ctx.dilation[1],
+            dilationH=ctx.dilation[0],
+            group=ctx.groups,
+            deformable_group=ctx.deform_groups,
+            im2col_step=cur_im2col_step)
         return output
 
     @staticmethod
@@ -87,266 +116,135 @@ class _DeformConv(Function):
 
         grad_input = grad_offset = grad_weight = None
 
-        if not grad_output.is_cuda:
-            raise NotImplementedError("Deformable Conv is not supported on CPUs!")
-        else:
-            cur_im2col_step = _DeformConv._cal_im2col_step(input.shape[0], ctx.im2col_step)
-            assert (input.shape[0] % cur_im2col_step) == 0, "im2col step must divide batchsize"
+        cur_im2col_step = min(ctx.im2col_step, input.size(0))
+        assert (input.size(0) % cur_im2col_step
+                ) == 0, 'batch size must be divisible by im2col_step'
 
-            if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
-                grad_input = torch.zeros_like(input)
-                grad_offset = torch.zeros_like(offset)
-                _C.deform_conv_backward_input(
-                    input,
-                    offset,
-                    grad_output,
-                    grad_input,
-                    grad_offset,
-                    weight,
-                    ctx.bufs_[0],
-                    weight.size(3),
-                    weight.size(2),
-                    ctx.stride[1],
-                    ctx.stride[0],
-                    ctx.padding[1],
-                    ctx.padding[0],
-                    ctx.dilation[1],
-                    ctx.dilation[0],
-                    ctx.groups,
-                    ctx.deformable_groups,
-                    cur_im2col_step,
-                )
+        grad_output = grad_output.contiguous()
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+            grad_input = torch.zeros_like(input)
+            grad_offset = torch.zeros_like(offset)
+            ext_module.deform_conv_backward_input(
+                input,
+                offset,
+                grad_output,
+                grad_input,
+                grad_offset,
+                weight,
+                ctx.bufs_[0],
+                kW=weight.size(3),
+                kH=weight.size(2),
+                dW=ctx.stride[1],
+                dH=ctx.stride[0],
+                padW=ctx.padding[1],
+                padH=ctx.padding[0],
+                dilationW=ctx.dilation[1],
+                dilationH=ctx.dilation[0],
+                group=ctx.groups,
+                deformable_group=ctx.deform_groups,
+                im2col_step=cur_im2col_step)
 
-            if ctx.needs_input_grad[2]:
-                grad_weight = torch.zeros_like(weight)
-                _C.deform_conv_backward_filter(
-                    input,
-                    offset,
-                    grad_output,
-                    grad_weight,
-                    ctx.bufs_[0],
-                    ctx.bufs_[1],
-                    weight.size(3),
-                    weight.size(2),
-                    ctx.stride[1],
-                    ctx.stride[0],
-                    ctx.padding[1],
-                    ctx.padding[0],
-                    ctx.dilation[1],
-                    ctx.dilation[0],
-                    ctx.groups,
-                    ctx.deformable_groups,
-                    1,
-                    cur_im2col_step,
-                )
+        if ctx.needs_input_grad[2]:
+            grad_weight = torch.zeros_like(weight)
+            ext_module.deform_conv_backward_parameters(
+                input,
+                offset,
+                grad_output,
+                grad_weight,
+                ctx.bufs_[0],
+                ctx.bufs_[1],
+                kW=weight.size(3),
+                kH=weight.size(2),
+                dW=ctx.stride[1],
+                dH=ctx.stride[0],
+                padW=ctx.padding[1],
+                padH=ctx.padding[0],
+                dilationW=ctx.dilation[1],
+                dilationH=ctx.dilation[0],
+                group=ctx.groups,
+                deformable_group=ctx.deform_groups,
+                scale=1,
+                im2col_step=cur_im2col_step)
 
-        return grad_input, grad_offset, grad_weight, None, None, None, None, None, None
+        return grad_input, grad_offset, grad_weight, \
+            None, None, None, None, None, None, None
 
     @staticmethod
-    def _output_size(input, weight, padding, dilation, stride):
+    def _output_size(ctx, input, weight):
         channels = weight.size(0)
         output_size = (input.size(0), channels)
         for d in range(input.dim() - 2):
             in_size = input.size(d + 2)
-            pad = padding[d]
-            kernel = dilation[d] * (weight.size(d + 2) - 1) + 1
-            stride_ = stride[d]
-            output_size += ((in_size + (2 * pad) - kernel) // stride_ + 1,)
+            pad = ctx.padding[d]
+            kernel = ctx.dilation[d] * (weight.size(d + 2) - 1) + 1
+            stride_ = ctx.stride[d]
+            output_size += ((in_size + (2 * pad) - kernel) // stride_ + 1, )
         if not all(map(lambda s: s > 0, output_size)):
             raise ValueError(
-                "convolution input is too small (output would be {})".format(
-                    "x".join(map(str, output_size))
-                )
-            )
+                'convolution input is too small (output would be ' +
+                'x'.join(map(str, output_size)) + ')')
         return output_size
 
-    @staticmethod
-    @lru_cache(maxsize=128)
-    def _cal_im2col_step(input_size, default_size):
-        """
-        Calculate proper im2col step size, which should be divisible by input_size and not larger
-        than prefer_size. Meanwhile the step size should be as large as possible to be more
-        efficient. So we choose the largest one among all divisors of input_size which are smaller
-        than prefer_size.
-        :param input_size: input batch size .
-        :param default_size: default preferred im2col step size.
-        :return: the largest proper step size.
-        """
-        if input_size <= default_size:
-            return input_size
-        best_step = 1
-        for step in range(2, min(int(math.sqrt(input_size)) + 1, default_size)):
-            if input_size % step == 0:
-                if input_size // step <= default_size:
-                    return input_size // step
-                best_step = step
 
-        return best_step
+deform_conv2d = DeformConv2dFunction.apply
 
 
-class _ModulatedDeformConv(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        input,
-        offset,
-        mask,
-        weight,
-        bias=None,
-        stride=1,
-        padding=0,
-        dilation=1,
-        groups=1,
-        deformable_groups=1,
-    ):
-        ctx.stride = stride
-        ctx.padding = padding
-        ctx.dilation = dilation
-        ctx.groups = groups
-        ctx.deformable_groups = deformable_groups
-        ctx.with_bias = bias is not None
-        if not ctx.with_bias:
-            bias = input.new_empty(1)  # fake tensor
-        if not input.is_cuda:
-            raise NotImplementedError("Deformable Conv is not supported on CPUs!")
-        if (
-            weight.requires_grad
-            or mask.requires_grad
-            or offset.requires_grad
-            or input.requires_grad
-        ):
-            ctx.save_for_backward(input, offset, mask, weight, bias)
-        output = input.new_empty(_ModulatedDeformConv._infer_shape(ctx, input, weight))
-        ctx._bufs = [input.new_empty(0), input.new_empty(0)]
-        _C.modulated_deform_conv_forward(
-            input,
-            weight,
-            bias,
-            ctx._bufs[0],
-            offset,
-            mask,
-            output,
-            ctx._bufs[1],
-            weight.shape[2],
-            weight.shape[3],
-            ctx.stride,
-            ctx.stride,
-            ctx.padding,
-            ctx.padding,
-            ctx.dilation,
-            ctx.dilation,
-            ctx.groups,
-            ctx.deformable_groups,
-            ctx.with_bias,
-        )
-        return output
+class DeformConv2d(nn.Module):
+    r"""Deformable 2D convolution.
 
-    @staticmethod
-    @once_differentiable
-    def backward(ctx, grad_output):
-        if not grad_output.is_cuda:
-            raise NotImplementedError("Deformable Conv is not supported on CPUs!")
-        input, offset, mask, weight, bias = ctx.saved_tensors
-        grad_input = torch.zeros_like(input)
-        grad_offset = torch.zeros_like(offset)
-        grad_mask = torch.zeros_like(mask)
-        grad_weight = torch.zeros_like(weight)
-        grad_bias = torch.zeros_like(bias)
-        _C.modulated_deform_conv_backward(
-            input,
-            weight,
-            bias,
-            ctx._bufs[0],
-            offset,
-            mask,
-            ctx._bufs[1],
-            grad_input,
-            grad_weight,
-            grad_bias,
-            grad_offset,
-            grad_mask,
-            grad_output,
-            weight.shape[2],
-            weight.shape[3],
-            ctx.stride,
-            ctx.stride,
-            ctx.padding,
-            ctx.padding,
-            ctx.dilation,
-            ctx.dilation,
-            ctx.groups,
-            ctx.deformable_groups,
-            ctx.with_bias,
-        )
-        if not ctx.with_bias:
-            grad_bias = None
+    Applies a deformable 2D convolution over an input signal composed of
+    several input planes. DeformConv2d was described in the paper
+    `Deformable Convolutional Networks
+    <https://arxiv.org/pdf/1703.06211.pdf>`_
 
-        return (
-            grad_input,
-            grad_offset,
-            grad_mask,
-            grad_weight,
-            grad_bias,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+    Note:
+        The argument ``im2col_step`` was added in version 1.3.17, which means
+        number of samples processed by the ``im2col_cuda_kernel`` per call.
+        It enables users to define ``batch_size`` and ``im2col_step`` more
+        flexibly and solved `issue mmcv#1440
+        <https://github.com/open-mmlab/mmcv/issues/1440>`_.
 
-    @staticmethod
-    def _infer_shape(ctx, input, weight):
-        n = input.size(0)
-        channels_out = weight.size(0)
-        height, width = input.shape[2:4]
-        kernel_h, kernel_w = weight.shape[2:4]
-        height_out = (
-            height + 2 * ctx.padding - (ctx.dilation * (kernel_h - 1) + 1)
-        ) // ctx.stride + 1
-        width_out = (
-            width + 2 * ctx.padding - (ctx.dilation * (kernel_w - 1) + 1)
-        ) // ctx.stride + 1
-        return n, channels_out, height_out, width_out
+    Args:
+        in_channels (int): Number of channels in the input image.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size(int, tuple): Size of the convolving kernel.
+        stride(int, tuple): Stride of the convolution. Default: 1.
+        padding (int or tuple): Zero-padding added to both sides of the input.
+            Default: 0.
+        dilation (int or tuple): Spacing between kernel elements. Default: 1.
+        groups (int): Number of blocked connections from input.
+            channels to output channels. Default: 1.
+        deform_groups (int): Number of deformable group partitions.
+        bias (bool): If True, adds a learnable bias to the output.
+            Default: False.
+        im2col_step (int): Number of samples processed by im2col_cuda_kernel
+            per call. It will work when ``batch_size`` > ``im2col_step``, but
+            ``batch_size`` must be divisible by ``im2col_step``. Default: 32.
+            `New in version 1.3.17.`
+    """
 
+    @deprecated_api_warning({'deformable_groups': 'deform_groups'},
+                            cls_name='DeformConv2d')
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: Union[int, Tuple[int, ...]],
+                 stride: Union[int, Tuple[int, ...]] = 1,
+                 padding: Union[int, Tuple[int, ...]] = 0,
+                 dilation: Union[int, Tuple[int, ...]] = 1,
+                 groups: int = 1,
+                 deform_groups: int = 1,
+                 bias: bool = False,
+                 im2col_step: int = 32) -> None:
+        super(DeformConv2d, self).__init__()
 
-deform_conv = _DeformConv.apply
-modulated_deform_conv = _ModulatedDeformConv.apply
-
-
-class DeformConv(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        groups=1,
-        deformable_groups=1,
-        bias=False,
-        norm=None,
-        activation=None,
-    ):
-        """
-        Deformable convolution from :paper:`deformconv`.
-
-        Arguments are similar to :class:`Conv2D`. Extra arguments:
-
-        Args:
-            deformable_groups (int): number of groups used in deformable convolution.
-            norm (nn.Module, optional): a normalization layer
-            activation (callable(Tensor) -> Tensor): a callable activation function
-        """
-        super(DeformConv, self).__init__()
-
-        assert not bias
-        assert in_channels % groups == 0, "in_channels {} cannot be divisible by groups {}".format(
-            in_channels, groups
-        )
-        assert (
-            out_channels % groups == 0
-        ), "out_channels {} cannot be divisible by groups {}".format(out_channels, groups)
+        assert not bias, \
+            f'bias={bias} is not supported in DeformConv2d.'
+        assert in_channels % groups == 0, \
+            f'in_channels {in_channels} cannot be divisible by groups {groups}'
+        assert out_channels % groups == 0, \
+            f'out_channels {out_channels} cannot be divisible by groups \
+              {groups}'
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -355,160 +253,153 @@ class DeformConv(nn.Module):
         self.padding = _pair(padding)
         self.dilation = _pair(dilation)
         self.groups = groups
-        self.deformable_groups = deformable_groups
-        self.norm = norm
-        self.activation = activation
+        self.deform_groups = deform_groups
+        self.im2col_step = im2col_step
+        # enable compatibility with nn.Conv2d
+        self.transposed = False
+        self.output_padding = _single(0)
 
+        # only weight, no bias
         self.weight = nn.Parameter(
-            torch.Tensor(out_channels, in_channels // self.groups, *self.kernel_size)
-        )
-        self.bias = None
+            torch.Tensor(out_channels, in_channels // self.groups,
+                         *self.kernel_size))
 
-        nn.init.kaiming_uniform_(self.weight, nonlinearity="relu")
+        self.reset_parameters()
 
-    def forward(self, x, offset):
-        if x.numel() == 0:
-            # When input is empty, we want to return a empty tensor with "correct" shape,
-            # So that the following operations will not panic
-            # if they check for the shape of the tensor.
-            # This computes the height and width of the output tensor
-            output_shape = [
-                (i + 2 * p - (di * (k - 1) + 1)) // s + 1
-                for i, p, di, k, s in zip(
-                    x.shape[-2:], self.padding, self.dilation, self.kernel_size, self.stride
-                )
-            ]
-            output_shape = [x.shape[0], self.weight.shape[0]] + output_shape
-            return _NewEmptyTensorOp.apply(x, output_shape)
+    def reset_parameters(self):
+        # switch the initialization of `self.weight` to the standard kaiming
+        # method described in `Delving deep into rectifiers: Surpassing
+        # human-level performance on ImageNet classification` - He, K. et al.
+        # (2015), using a uniform distribution
+        nn.init.kaiming_uniform_(self.weight, nonlinearity='relu')
 
-        x = deform_conv(
-            x,
-            offset,
-            self.weight,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-            self.deformable_groups,
-        )
-        if self.norm is not None:
-            x = self.norm(x)
-        if self.activation is not None:
-            x = self.activation(x)
-        return x
-
-    def extra_repr(self):
-        tmpstr = "in_channels=" + str(self.in_channels)
-        tmpstr += ", out_channels=" + str(self.out_channels)
-        tmpstr += ", kernel_size=" + str(self.kernel_size)
-        tmpstr += ", stride=" + str(self.stride)
-        tmpstr += ", padding=" + str(self.padding)
-        tmpstr += ", dilation=" + str(self.dilation)
-        tmpstr += ", groups=" + str(self.groups)
-        tmpstr += ", deformable_groups=" + str(self.deformable_groups)
-        tmpstr += ", bias=False"
-        return tmpstr
-
-
-class ModulatedDeformConv(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size,
-        stride=1,
-        padding=0,
-        dilation=1,
-        groups=1,
-        deformable_groups=1,
-        bias=True,
-        norm=None,
-        activation=None,
-    ):
-        """
-        Modulated deformable convolution from :paper:`deformconv2`.
-
-        Arguments are similar to :class:`Conv2D`. Extra arguments:
+    def forward(self, x: Tensor, offset: Tensor) -> Tensor:
+        """Deformable Convolutional forward function.
 
         Args:
-            deformable_groups (int): number of groups used in deformable convolution.
-            norm (nn.Module, optional): a normalization layer
-            activation (callable(Tensor) -> Tensor): a callable activation function
+            x (Tensor): Input feature, shape (B, C_in, H_in, W_in)
+            offset (Tensor): Offset for deformable convolution, shape
+                (B, deform_groups*kernel_size[0]*kernel_size[1]*2,
+                H_out, W_out), H_out, W_out are equal to the output's.
+
+                An offset is like `[y0, x0, y1, x1, y2, x2, ..., y8, x8]`.
+                The spatial arrangement is like:
+
+                .. code:: text
+
+                    (x0, y0) (x1, y1) (x2, y2)
+                    (x3, y3) (x4, y4) (x5, y5)
+                    (x6, y6) (x7, y7) (x8, y8)
+
+        Returns:
+            Tensor: Output of the layer.
         """
-        super(ModulatedDeformConv, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = _pair(kernel_size)
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
-        self.deformable_groups = deformable_groups
-        self.with_bias = bias
-        self.norm = norm
-        self.activation = activation
+        # To fix an assert error in deform_conv_cuda.cpp:128
+        # input image is smaller than kernel
+        input_pad = (x.size(2) < self.kernel_size[0]) or (x.size(3) <
+                                                          self.kernel_size[1])
+        if input_pad:
+            pad_h = max(self.kernel_size[0] - x.size(2), 0)
+            pad_w = max(self.kernel_size[1] - x.size(3), 0)
+            x = F.pad(x, (0, pad_w, 0, pad_h), 'constant', 0).contiguous()
+            offset = F.pad(offset, (0, pad_w, 0, pad_h), 'constant', 0)
+            offset = offset.contiguous()
+        out = deform_conv2d(x, offset, self.weight, self.stride, self.padding,
+                            self.dilation, self.groups, self.deform_groups,
+                            False, self.im2col_step)
+        if input_pad:
+            out = out[:, :, :out.size(2) - pad_h, :out.size(3) -
+                      pad_w].contiguous()
+        return out
 
-        self.weight = nn.Parameter(
-            torch.Tensor(out_channels, in_channels // groups, *self.kernel_size)
-        )
-        if bias:
-            self.bias = nn.Parameter(torch.Tensor(out_channels))
-        else:
-            self.bias = None
-
-        nn.init.kaiming_uniform_(self.weight, nonlinearity="relu")
-        if self.bias is not None:
-            nn.init.constant_(self.bias, 0)
-
-    def forward(self, x, offset, mask):
-        if x.numel() == 0:
-            output_shape = [
-                (i + 2 * p - (di * (k - 1) + 1)) // s + 1
-                for i, p, di, k, s in zip(
-                    x.shape[-2:], self.padding, self.dilation, self.kernel_size, self.stride
-                )
-            ]
-            output_shape = [x.shape[0], self.weight.shape[0]] + output_shape
-            return _NewEmptyTensorOp.apply(x, output_shape)
-
-        x = modulated_deform_conv(
-            x,
-            offset,
-            mask,
-            self.weight,
-            self.bias,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-            self.deformable_groups,
-        )
-        if self.norm is not None:
-            x = self.norm(x)
-        if self.activation is not None:
-            x = self.activation(x)
-        return x
-
-    def extra_repr(self):
-        tmpstr = "in_channels=" + str(self.in_channels)
-        tmpstr += ", out_channels=" + str(self.out_channels)
-        tmpstr += ", kernel_size=" + str(self.kernel_size)
-        tmpstr += ", stride=" + str(self.stride)
-        tmpstr += ", padding=" + str(self.padding)
-        tmpstr += ", dilation=" + str(self.dilation)
-        tmpstr += ", groups=" + str(self.groups)
-        tmpstr += ", deformable_groups=" + str(self.deformable_groups)
-        tmpstr += ", bias=" + str(self.with_bias)
-        return tmpstr
+    def __repr__(self):
+        s = self.__class__.__name__
+        s += f'(in_channels={self.in_channels},\n'
+        s += f'out_channels={self.out_channels},\n'
+        s += f'kernel_size={self.kernel_size},\n'
+        s += f'stride={self.stride},\n'
+        s += f'padding={self.padding},\n'
+        s += f'dilation={self.dilation},\n'
+        s += f'groups={self.groups},\n'
+        s += f'deform_groups={self.deform_groups},\n'
+        # bias is not supported in DeformConv2d.
+        s += 'bias=False)'
+        return s
 
 
-try:
-    from detectron2 import _C
-except ImportError:
-    # TODO: register ops natively so there is no need to import _C.
-    _msg = "detectron2 is not compiled successfully, please build following the instructions!"
-    _args = ("detectron2._C", _msg)
-    DeformConv = create_dummy_class("DeformConv", *_args)
-    ModulatedDeformConv = create_dummy_class("ModulatedDeformConv", *_args)
-    deform_conv = create_dummy_func("deform_conv", *_args)
-    modulated_deform_conv = create_dummy_func("modulated_deform_conv", *_args)
+@CONV_LAYERS.register_module('DCN')
+class DeformConv2dPack(DeformConv2d):
+    """A Deformable Conv Encapsulation that acts as normal Conv layers.
+
+    The offset tensor is like `[y0, x0, y1, x1, y2, x2, ..., y8, x8]`.
+    The spatial arrangement is like:
+
+    .. code:: text
+
+        (x0, y0) (x1, y1) (x2, y2)
+        (x3, y3) (x4, y4) (x5, y5)
+        (x6, y6) (x7, y7) (x8, y8)
+
+    Args:
+        in_channels (int): Same as nn.Conv2d.
+        out_channels (int): Same as nn.Conv2d.
+        kernel_size (int or tuple[int]): Same as nn.Conv2d.
+        stride (int or tuple[int]): Same as nn.Conv2d.
+        padding (int or tuple[int]): Same as nn.Conv2d.
+        dilation (int or tuple[int]): Same as nn.Conv2d.
+        groups (int): Same as nn.Conv2d.
+        bias (bool or str): If specified as `auto`, it will be decided by the
+            norm_cfg. Bias will be set as True if norm_cfg is None, otherwise
+            False.
+    """
+
+    _version = 2
+
+    def __init__(self, *args, **kwargs):
+        super(DeformConv2dPack, self).__init__(*args, **kwargs)
+        self.conv_offset = nn.Conv2d(
+            self.in_channels,
+            self.deform_groups * 2 * self.kernel_size[0] * self.kernel_size[1],
+            kernel_size=self.kernel_size,
+            stride=_pair(self.stride),
+            padding=_pair(self.padding),
+            dilation=_pair(self.dilation),
+            bias=True)
+        self.init_offset()
+
+    def init_offset(self):
+        self.conv_offset.weight.data.zero_()
+        self.conv_offset.bias.data.zero_()
+
+    def forward(self, x):
+        offset = self.conv_offset(x)
+        return deform_conv2d(x, offset, self.weight, self.stride, self.padding,
+                             self.dilation, self.groups, self.deform_groups,
+                             False, self.im2col_step)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        version = local_metadata.get('version', None)
+
+        if version is None or version < 2:
+            # the key is different in early versions
+            # In version < 2, DeformConvPack loads previous benchmark models.
+            if (prefix + 'conv_offset.weight' not in state_dict
+                    and prefix[:-1] + '_offset.weight' in state_dict):
+                state_dict[prefix + 'conv_offset.weight'] = state_dict.pop(
+                    prefix[:-1] + '_offset.weight')
+            if (prefix + 'conv_offset.bias' not in state_dict
+                    and prefix[:-1] + '_offset.bias' in state_dict):
+                state_dict[prefix +
+                           'conv_offset.bias'] = state_dict.pop(prefix[:-1] +
+                                                                '_offset.bias')
+
+        if version is not None and version > 1:
+            print_log(
+                f'DeformConv2dPack {prefix.rstrip(".")} is upgraded to '
+                'version 2.',
+                logger='root')
+
+        super()._load_from_state_dict(state_dict, prefix, local_metadata,
+                                      strict, missing_keys, unexpected_keys,
+                                      error_msgs)
