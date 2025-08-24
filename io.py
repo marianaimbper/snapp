@@ -1,318 +1,258 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import io
 import os.path as osp
-from collections import OrderedDict
+from pathlib import Path
 
 import cv2
-from cv2 import (CAP_PROP_FOURCC, CAP_PROP_FPS, CAP_PROP_FRAME_COUNT,
-                 CAP_PROP_FRAME_HEIGHT, CAP_PROP_FRAME_WIDTH,
-                 CAP_PROP_POS_FRAMES, VideoWriter_fourcc)
+import numpy as np
+from cv2 import (IMREAD_COLOR, IMREAD_GRAYSCALE, IMREAD_IGNORE_ORIENTATION,
+                 IMREAD_UNCHANGED)
 
-from annotator.uniformer.mmcv.utils import (check_file_exist, mkdir_or_exist, scandir,
-                        track_progress)
+from annotator.uniformer.mmcv.utils import check_file_exist, is_str, mkdir_or_exist
 
+try:
+    from turbojpeg import TJCS_RGB, TJPF_BGR, TJPF_GRAY, TurboJPEG
+except ImportError:
+    TJCS_RGB = TJPF_GRAY = TJPF_BGR = TurboJPEG = None
 
-class Cache:
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = None
 
-    def __init__(self, capacity):
-        self._cache = OrderedDict()
-        self._capacity = int(capacity)
-        if capacity <= 0:
-            raise ValueError('capacity must be a positive integer')
+try:
+    import tifffile
+except ImportError:
+    tifffile = None
 
-    @property
-    def capacity(self):
-        return self._capacity
+jpeg = None
+supported_backends = ['cv2', 'turbojpeg', 'pillow', 'tifffile']
 
-    @property
-    def size(self):
-        return len(self._cache)
+imread_flags = {
+    'color': IMREAD_COLOR,
+    'grayscale': IMREAD_GRAYSCALE,
+    'unchanged': IMREAD_UNCHANGED,
+    'color_ignore_orientation': IMREAD_IGNORE_ORIENTATION | IMREAD_COLOR,
+    'grayscale_ignore_orientation':
+    IMREAD_IGNORE_ORIENTATION | IMREAD_GRAYSCALE
+}
 
-    def put(self, key, val):
-        if key in self._cache:
-            return
-        if len(self._cache) >= self.capacity:
-            self._cache.popitem(last=False)
-        self._cache[key] = val
-
-    def get(self, key, default=None):
-        val = self._cache[key] if key in self._cache else default
-        return val
-
-
-class VideoReader:
-    """Video class with similar usage to a list object.
-
-    This video warpper class provides convenient apis to access frames.
-    There exists an issue of OpenCV's VideoCapture class that jumping to a
-    certain frame may be inaccurate. It is fixed in this class by checking
-    the position after jumping each time.
-    Cache is used when decoding videos. So if the same frame is visited for
-    the second time, there is no need to decode again if it is stored in the
-    cache.
-
-    :Example:
-
-    >>> import annotator.uniformer.mmcv as mmcv
-    >>> v = mmcv.VideoReader('sample.mp4')
-    >>> len(v)  # get the total frame number with `len()`
-    120
-    >>> for img in v:  # v is iterable
-    >>>     mmcv.imshow(img)
-    >>> v[5]  # get the 6th frame
-    """
-
-    def __init__(self, filename, cache_capacity=10):
-        # Check whether the video path is a url
-        if not filename.startswith(('https://', 'http://')):
-            check_file_exist(filename, 'Video file not found: ' + filename)
-        self._vcap = cv2.VideoCapture(filename)
-        assert cache_capacity > 0
-        self._cache = Cache(cache_capacity)
-        self._position = 0
-        # get basic info
-        self._width = int(self._vcap.get(CAP_PROP_FRAME_WIDTH))
-        self._height = int(self._vcap.get(CAP_PROP_FRAME_HEIGHT))
-        self._fps = self._vcap.get(CAP_PROP_FPS)
-        self._frame_cnt = int(self._vcap.get(CAP_PROP_FRAME_COUNT))
-        self._fourcc = self._vcap.get(CAP_PROP_FOURCC)
-
-    @property
-    def vcap(self):
-        """:obj:`cv2.VideoCapture`: The raw VideoCapture object."""
-        return self._vcap
-
-    @property
-    def opened(self):
-        """bool: Indicate whether the video is opened."""
-        return self._vcap.isOpened()
-
-    @property
-    def width(self):
-        """int: Width of video frames."""
-        return self._width
-
-    @property
-    def height(self):
-        """int: Height of video frames."""
-        return self._height
-
-    @property
-    def resolution(self):
-        """tuple: Video resolution (width, height)."""
-        return (self._width, self._height)
-
-    @property
-    def fps(self):
-        """float: FPS of the video."""
-        return self._fps
-
-    @property
-    def frame_cnt(self):
-        """int: Total frames of the video."""
-        return self._frame_cnt
-
-    @property
-    def fourcc(self):
-        """str: "Four character code" of the video."""
-        return self._fourcc
-
-    @property
-    def position(self):
-        """int: Current cursor position, indicating frame decoded."""
-        return self._position
-
-    def _get_real_position(self):
-        return int(round(self._vcap.get(CAP_PROP_POS_FRAMES)))
-
-    def _set_real_position(self, frame_id):
-        self._vcap.set(CAP_PROP_POS_FRAMES, frame_id)
-        pos = self._get_real_position()
-        for _ in range(frame_id - pos):
-            self._vcap.read()
-        self._position = frame_id
-
-    def read(self):
-        """Read the next frame.
-
-        If the next frame have been decoded before and in the cache, then
-        return it directly, otherwise decode, cache and return it.
-
-        Returns:
-            ndarray or None: Return the frame if successful, otherwise None.
-        """
-        # pos = self._position
-        if self._cache:
-            img = self._cache.get(self._position)
-            if img is not None:
-                ret = True
-            else:
-                if self._position != self._get_real_position():
-                    self._set_real_position(self._position)
-                ret, img = self._vcap.read()
-                if ret:
-                    self._cache.put(self._position, img)
-        else:
-            ret, img = self._vcap.read()
-        if ret:
-            self._position += 1
-        return img
-
-    def get_frame(self, frame_id):
-        """Get frame by index.
-
-        Args:
-            frame_id (int): Index of the expected frame, 0-based.
-
-        Returns:
-            ndarray or None: Return the frame if successful, otherwise None.
-        """
-        if frame_id < 0 or frame_id >= self._frame_cnt:
-            raise IndexError(
-                f'"frame_id" must be between 0 and {self._frame_cnt - 1}')
-        if frame_id == self._position:
-            return self.read()
-        if self._cache:
-            img = self._cache.get(frame_id)
-            if img is not None:
-                self._position = frame_id + 1
-                return img
-        self._set_real_position(frame_id)
-        ret, img = self._vcap.read()
-        if ret:
-            if self._cache:
-                self._cache.put(self._position, img)
-            self._position += 1
-        return img
-
-    def current_frame(self):
-        """Get the current frame (frame that is just visited).
-
-        Returns:
-            ndarray or None: If the video is fresh, return None, otherwise
-                return the frame.
-        """
-        if self._position == 0:
-            return None
-        return self._cache.get(self._position - 1)
-
-    def cvt2frames(self,
-                   frame_dir,
-                   file_start=0,
-                   filename_tmpl='{:06d}.jpg',
-                   start=0,
-                   max_num=0,
-                   show_progress=True):
-        """Convert a video to frame images.
-
-        Args:
-            frame_dir (str): Output directory to store all the frame images.
-            file_start (int): Filenames will start from the specified number.
-            filename_tmpl (str): Filename template with the index as the
-                placeholder.
-            start (int): The starting frame index.
-            max_num (int): Maximum number of frames to be written.
-            show_progress (bool): Whether to show a progress bar.
-        """
-        mkdir_or_exist(frame_dir)
-        if max_num == 0:
-            task_num = self.frame_cnt - start
-        else:
-            task_num = min(self.frame_cnt - start, max_num)
-        if task_num <= 0:
-            raise ValueError('start must be less than total frame number')
-        if start > 0:
-            self._set_real_position(start)
-
-        def write_frame(file_idx):
-            img = self.read()
-            if img is None:
-                return
-            filename = osp.join(frame_dir, filename_tmpl.format(file_idx))
-            cv2.imwrite(filename, img)
-
-        if show_progress:
-            track_progress(write_frame, range(file_start,
-                                              file_start + task_num))
-        else:
-            for i in range(task_num):
-                write_frame(file_start + i)
-
-    def __len__(self):
-        return self.frame_cnt
-
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            return [
-                self.get_frame(i)
-                for i in range(*index.indices(self.frame_cnt))
-            ]
-        # support negative indexing
-        if index < 0:
-            index += self.frame_cnt
-            if index < 0:
-                raise IndexError('index out of range')
-        return self.get_frame(index)
-
-    def __iter__(self):
-        self._set_real_position(0)
-        return self
-
-    def __next__(self):
-        img = self.read()
-        if img is not None:
-            return img
-        else:
-            raise StopIteration
-
-    next = __next__
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self._vcap.release()
+imread_backend = 'cv2'
 
 
-def frames2video(frame_dir,
-                 video_file,
-                 fps=30,
-                 fourcc='XVID',
-                 filename_tmpl='{:06d}.jpg',
-                 start=0,
-                 end=0,
-                 show_progress=True):
-    """Read the frame images from a directory and join them as a video.
+def use_backend(backend):
+    """Select a backend for image decoding.
 
     Args:
-        frame_dir (str): The directory containing video frames.
-        video_file (str): Output filename.
-        fps (float): FPS of the output video.
-        fourcc (str): Fourcc of the output video, this should be compatible
-            with the output file type.
-        filename_tmpl (str): Filename template with the index as the variable.
-        start (int): Starting frame index.
-        end (int): Ending frame index.
-        show_progress (bool): Whether to show a progress bar.
+        backend (str): The image decoding backend type. Options are `cv2`,
+        `pillow`, `turbojpeg` (see https://github.com/lilohuang/PyTurboJPEG)
+        and `tifffile`. `turbojpeg` is faster but it only supports `.jpeg`
+        file format.
     """
-    if end == 0:
-        ext = filename_tmpl.split('.')[-1]
-        end = len([name for name in scandir(frame_dir, ext)])
-    first_file = osp.join(frame_dir, filename_tmpl.format(start))
-    check_file_exist(first_file, 'The start frame not found: ' + first_file)
-    img = cv2.imread(first_file)
-    height, width = img.shape[:2]
-    resolution = (width, height)
-    vwriter = cv2.VideoWriter(video_file, VideoWriter_fourcc(*fourcc), fps,
-                              resolution)
+    assert backend in supported_backends
+    global imread_backend
+    imread_backend = backend
+    if imread_backend == 'turbojpeg':
+        if TurboJPEG is None:
+            raise ImportError('`PyTurboJPEG` is not installed')
+        global jpeg
+        if jpeg is None:
+            jpeg = TurboJPEG()
+    elif imread_backend == 'pillow':
+        if Image is None:
+            raise ImportError('`Pillow` is not installed')
+    elif imread_backend == 'tifffile':
+        if tifffile is None:
+            raise ImportError('`tifffile` is not installed')
 
-    def write_frame(file_idx):
-        filename = osp.join(frame_dir, filename_tmpl.format(file_idx))
-        img = cv2.imread(filename)
-        vwriter.write(img)
 
-    if show_progress:
-        track_progress(write_frame, range(start, end))
+def _jpegflag(flag='color', channel_order='bgr'):
+    channel_order = channel_order.lower()
+    if channel_order not in ['rgb', 'bgr']:
+        raise ValueError('channel order must be either "rgb" or "bgr"')
+
+    if flag == 'color':
+        if channel_order == 'bgr':
+            return TJPF_BGR
+        elif channel_order == 'rgb':
+            return TJCS_RGB
+    elif flag == 'grayscale':
+        return TJPF_GRAY
     else:
-        for i in range(start, end):
-            write_frame(i)
-    vwriter.release()
+        raise ValueError('flag must be "color" or "grayscale"')
+
+
+def _pillow2array(img, flag='color', channel_order='bgr'):
+    """Convert a pillow image to numpy array.
+
+    Args:
+        img (:obj:`PIL.Image.Image`): The image loaded using PIL
+        flag (str): Flags specifying the color type of a loaded image,
+            candidates are 'color', 'grayscale' and 'unchanged'.
+            Default to 'color'.
+        channel_order (str): The channel order of the output image array,
+            candidates are 'bgr' and 'rgb'. Default to 'bgr'.
+
+    Returns:
+        np.ndarray: The converted numpy array
+    """
+    channel_order = channel_order.lower()
+    if channel_order not in ['rgb', 'bgr']:
+        raise ValueError('channel order must be either "rgb" or "bgr"')
+
+    if flag == 'unchanged':
+        array = np.array(img)
+        if array.ndim >= 3 and array.shape[2] >= 3:  # color image
+            array[:, :, :3] = array[:, :, (2, 1, 0)]  # RGB to BGR
+    else:
+        # Handle exif orientation tag
+        if flag in ['color', 'grayscale']:
+            img = ImageOps.exif_transpose(img)
+        # If the image mode is not 'RGB', convert it to 'RGB' first.
+        if img.mode != 'RGB':
+            if img.mode != 'LA':
+                # Most formats except 'LA' can be directly converted to RGB
+                img = img.convert('RGB')
+            else:
+                # When the mode is 'LA', the default conversion will fill in
+                #  the canvas with black, which sometimes shadows black objects
+                #  in the foreground.
+                #
+                # Therefore, a random color (124, 117, 104) is used for canvas
+                img_rgba = img.convert('RGBA')
+                img = Image.new('RGB', img_rgba.size, (124, 117, 104))
+                img.paste(img_rgba, mask=img_rgba.split()[3])  # 3 is alpha
+        if flag in ['color', 'color_ignore_orientation']:
+            array = np.array(img)
+            if channel_order != 'rgb':
+                array = array[:, :, ::-1]  # RGB to BGR
+        elif flag in ['grayscale', 'grayscale_ignore_orientation']:
+            img = img.convert('L')
+            array = np.array(img)
+        else:
+            raise ValueError(
+                'flag must be "color", "grayscale", "unchanged", '
+                f'"color_ignore_orientation" or "grayscale_ignore_orientation"'
+                f' but got {flag}')
+    return array
+
+
+def imread(img_or_path, flag='color', channel_order='bgr', backend=None):
+    """Read an image.
+
+    Args:
+        img_or_path (ndarray or str or Path): Either a numpy array or str or
+            pathlib.Path. If it is a numpy array (loaded image), then
+            it will be returned as is.
+        flag (str): Flags specifying the color type of a loaded image,
+            candidates are `color`, `grayscale`, `unchanged`,
+            `color_ignore_orientation` and `grayscale_ignore_orientation`.
+            By default, `cv2` and `pillow` backend would rotate the image
+            according to its EXIF info unless called with `unchanged` or
+            `*_ignore_orientation` flags. `turbojpeg` and `tifffile` backend
+            always ignore image's EXIF info regardless of the flag.
+            The `turbojpeg` backend only supports `color` and `grayscale`.
+        channel_order (str): Order of channel, candidates are `bgr` and `rgb`.
+        backend (str | None): The image decoding backend type. Options are
+            `cv2`, `pillow`, `turbojpeg`, `tifffile`, `None`.
+            If backend is None, the global imread_backend specified by
+            ``mmcv.use_backend()`` will be used. Default: None.
+
+    Returns:
+        ndarray: Loaded image array.
+    """
+
+    if backend is None:
+        backend = imread_backend
+    if backend not in supported_backends:
+        raise ValueError(f'backend: {backend} is not supported. Supported '
+                         "backends are 'cv2', 'turbojpeg', 'pillow'")
+    if isinstance(img_or_path, Path):
+        img_or_path = str(img_or_path)
+
+    if isinstance(img_or_path, np.ndarray):
+        return img_or_path
+    elif is_str(img_or_path):
+        check_file_exist(img_or_path,
+                         f'img file does not exist: {img_or_path}')
+        if backend == 'turbojpeg':
+            with open(img_or_path, 'rb') as in_file:
+                img = jpeg.decode(in_file.read(),
+                                  _jpegflag(flag, channel_order))
+                if img.shape[-1] == 1:
+                    img = img[:, :, 0]
+            return img
+        elif backend == 'pillow':
+            img = Image.open(img_or_path)
+            img = _pillow2array(img, flag, channel_order)
+            return img
+        elif backend == 'tifffile':
+            img = tifffile.imread(img_or_path)
+            return img
+        else:
+            flag = imread_flags[flag] if is_str(flag) else flag
+            img = cv2.imread(img_or_path, flag)
+            if flag == IMREAD_COLOR and channel_order == 'rgb':
+                cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)
+            return img
+    else:
+        raise TypeError('"img" must be a numpy array or a str or '
+                        'a pathlib.Path object')
+
+
+def imfrombytes(content, flag='color', channel_order='bgr', backend=None):
+    """Read an image from bytes.
+
+    Args:
+        content (bytes): Image bytes got from files or other streams.
+        flag (str): Same as :func:`imread`.
+        backend (str | None): The image decoding backend type. Options are
+            `cv2`, `pillow`, `turbojpeg`, `None`. If backend is None, the
+            global imread_backend specified by ``mmcv.use_backend()`` will be
+            used. Default: None.
+
+    Returns:
+        ndarray: Loaded image array.
+    """
+
+    if backend is None:
+        backend = imread_backend
+    if backend not in supported_backends:
+        raise ValueError(f'backend: {backend} is not supported. Supported '
+                         "backends are 'cv2', 'turbojpeg', 'pillow'")
+    if backend == 'turbojpeg':
+        img = jpeg.decode(content, _jpegflag(flag, channel_order))
+        if img.shape[-1] == 1:
+            img = img[:, :, 0]
+        return img
+    elif backend == 'pillow':
+        buff = io.BytesIO(content)
+        img = Image.open(buff)
+        img = _pillow2array(img, flag, channel_order)
+        return img
+    else:
+        img_np = np.frombuffer(content, np.uint8)
+        flag = imread_flags[flag] if is_str(flag) else flag
+        img = cv2.imdecode(img_np, flag)
+        if flag == IMREAD_COLOR and channel_order == 'rgb':
+            cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)
+        return img
+
+
+def imwrite(img, file_path, params=None, auto_mkdir=True):
+    """Write image to file.
+
+    Args:
+        img (ndarray): Image array to be written.
+        file_path (str): Image file path.
+        params (None or list): Same as opencv :func:`imwrite` interface.
+        auto_mkdir (bool): If the parent folder of `file_path` does not exist,
+            whether to create it automatically.
+
+    Returns:
+        bool: Successful or not.
+    """
+    if auto_mkdir:
+        dir_name = osp.abspath(osp.dirname(file_path))
+        mkdir_or_exist(dir_name)
+    return cv2.imwrite(file_path, img, params)
