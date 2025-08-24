@@ -24,12 +24,11 @@ class AutoencoderKL(pl.LightningModule):
                  learn_logvar=False
                  ):
         super().__init__()
-        self.lossconfig = lossconfig
         self.learn_logvar = learn_logvar
         self.image_key = image_key
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
-        self.loss = torch.nn.Identity()
+        self.loss = instantiate_from_config(lossconfig)
         assert ddconfig["double_z"]
         self.quant_conv = torch.nn.Conv2d(2*ddconfig["z_channels"], 2*embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
@@ -49,8 +48,7 @@ class AutoencoderKL(pl.LightningModule):
 
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
-    def init_loss(self):
-        self.loss = instantiate_from_config(self.lossconfig)
+
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
         keys = list(sd.keys())
@@ -108,41 +106,27 @@ class AutoencoderKL(pl.LightningModule):
         x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
         return x
 
-    # def training_step(self, batch, batch_idx, optimizer_idx):
-    #     inputs = self.get_input(batch, self.image_key)
-    #     reconstructions, posterior = self(inputs)
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        inputs = self.get_input(batch, self.image_key)
+        reconstructions, posterior = self(inputs)
 
-    #     if optimizer_idx == 0:
-    #         # train encoder+decoder+logvar
-    #         aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
-    #                                         last_layer=self.get_last_layer(), split="train")
-    #         self.log("aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-    #         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-    #         return aeloss
+        if optimizer_idx == 0:
+            # train encoder+decoder+logvar
+            aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
+                                            last_layer=self.get_last_layer(), split="train")
+            self.log("aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+            return aeloss
 
-    #     if optimizer_idx == 1:
-    #         # train the discriminator
-    #         discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
-    #                                             last_layer=self.get_last_layer(), split="train")
+        if optimizer_idx == 1:
+            # train the discriminator
+            discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
+                                                last_layer=self.get_last_layer(), split="train")
 
-    #         self.log("discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-    #         self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-    #         return discloss
+            self.log("discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+            return discloss
 
-    # #### only mse loss ####
-    # def training_step(self, batch, batch_idx):
-    #     real_img = self.get_input(batch, self.image_key)
-    #     recon, _ = self(real_img)
-    #     recon = recon.clamp(-1, 1)
-    #     loss = F.mse_loss(recon.float(), real_img.clamp(-1, 1).float(), reduction="mean")
-    #     return loss
-
-    def training_step(self, batch, batch_idx):
-        real_img = self.get_input(batch, self.image_key)
-        recon, posterior = self(real_img)
-        loss = self.loss(real_img, recon, posterior)
-        return loss
-            
     def validation_step(self, batch, batch_idx):
         log_dict = self._validation_step(batch, batch_idx)
         with self.ema_scope():
@@ -162,28 +146,19 @@ class AutoencoderKL(pl.LightningModule):
         self.log_dict(log_dict_ae)
         self.log_dict(log_dict_disc)
         return self.log_dict
+
     def configure_optimizers(self):
         lr = self.learning_rate
-        ae_params_list = list(self.decoder.parameters())
+        ae_params_list = list(self.encoder.parameters()) + list(self.decoder.parameters()) + list(
+            self.quant_conv.parameters()) + list(self.post_quant_conv.parameters())
         if self.learn_logvar:
             print(f"{self.__class__.__name__}: Learning logvar")
             ae_params_list.append(self.loss.logvar)
         opt_ae = torch.optim.Adam(ae_params_list,
                                   lr=lr, betas=(0.5, 0.9))
-        return [opt_ae], []
-
-    # def configure_optimizers(self):
-    #     lr = self.learning_rate
-    #     ae_params_list = list(self.encoder.parameters()) + list(self.decoder.parameters()) + list(
-    #         self.quant_conv.parameters()) + list(self.post_quant_conv.parameters())
-    #     if self.learn_logvar:
-    #         print(f"{self.__class__.__name__}: Learning logvar")
-    #         ae_params_list.append(self.loss.logvar)
-    #     opt_ae = torch.optim.Adam(ae_params_list,
-    #                               lr=lr, betas=(0.5, 0.9))
-    #     opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
-    #                                 lr=lr, betas=(0.5, 0.9))
-    #     return [opt_ae, opt_disc], []
+        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
+                                    lr=lr, betas=(0.5, 0.9))
+        return [opt_ae, opt_disc], []
 
     def get_last_layer(self):
         return self.decoder.conv_out.weight

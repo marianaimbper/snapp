@@ -100,7 +100,7 @@ class DDIMSampler(object):
         size = (batch_size, C, H, W)
         print(f'Data shape for DDIM sampling is {size}, eta {eta}')
 
-        samples, intermediates, cond_output_dict = self.ddim_sampling(conditioning, size,
+        samples, intermediates = self.ddim_sampling(conditioning, size,
                                                     callback=callback,
                                                     img_callback=img_callback,
                                                     quantize_denoised=quantize_x0,
@@ -117,7 +117,7 @@ class DDIMSampler(object):
                                                     dynamic_threshold=dynamic_threshold,
                                                     ucg_schedule=ucg_schedule
                                                     )
-        return samples, intermediates, cond_output_dict
+        return samples, intermediates
 
     @torch.no_grad()
     def ddim_sampling(self, cond, shape,
@@ -167,7 +167,7 @@ class DDIMSampler(object):
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
                                       dynamic_threshold=dynamic_threshold)
-            img, pred_x0, cond_output_dict = outs
+            img, pred_x0 = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
 
@@ -175,33 +175,7 @@ class DDIMSampler(object):
                 intermediates['x_inter'].append(img)
                 intermediates['pred_x0'].append(pred_x0)
 
-        if cond_output_dict is not None:
-            cond_output = cond_output_dict["cond_output"]     
-            if self.model.use_noisy_cond:
-                b = cond_output.shape[0]
-
-                alphas = self.model.alphas_cumprod if ddim_use_original_steps else self.ddim_alphas
-                alphas_prev = self.model.alphas_cumprod_prev if ddim_use_original_steps else self.ddim_alphas_prev
-                sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if ddim_use_original_steps else self.ddim_sqrt_one_minus_alphas
-                sigmas = self.model.ddim_sigmas_for_original_num_steps if ddim_use_original_steps else self.ddim_sigmas
-
-                device = cond_output.device
-                a_t = torch.full((b, 1, 1, 1), alphas[0], device=device)
-                a_prev = torch.full((b, 1, 1, 1), alphas_prev[0], device=device)
-                sigma_t = torch.full((b, 1, 1, 1), sigmas[0], device=device)
-                sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[0], device=device)
-
-                c = cond_output_dict["cond_input"]
-                e_t = cond_output
-                pred_c0 = (c - sqrt_one_minus_at * e_t) / a_t.sqrt()
-                dir_ct = (1. - a_prev - sigma_t**2).sqrt() * e_t
-                noise = sigma_t * noise_like(c.shape, device, False) * temperature
-
-                if noise_dropout > 0.:
-                    noise = torch.nn.functional.dropout(noise, p=noise_dropout)
-                cond_output = a_prev.sqrt() * pred_c0 + dir_ct + noise               
-                cond_output_dict[f"cond_sample"] = cond_output
-        return img, intermediates, cond_output_dict
+        return img, intermediates
 
     @torch.no_grad()
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
@@ -209,46 +183,32 @@ class DDIMSampler(object):
                       unconditional_guidance_scale=1., unconditional_conditioning=None,
                       dynamic_threshold=None):
         b, *_, device = *x.shape, x.device
+
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            model_output, cond_output_dict = self.model.apply_model(x, t, c)
+            model_output = self.model.apply_model(x, t, c)
         else:
-            # x_in = torch.cat([x] * 2)
-            # t_in = torch.cat([t] * 2)
-            # if isinstance(c, dict):
-            #     assert isinstance(unconditional_conditioning, dict)
-            #     c_in = dict()
-            #     for k in c:
-            #         if isinstance(c[k], list):
-            #             c_in[k] = [torch.cat([
-            #                 unconditional_conditioning[k][i],
-            #                 c[k][i]]) for i in range(len(c[k]))]
-            #         else:
-            #             c_in[k] = torch.cat([
-            #                     unconditional_conditioning[k],
-            #                     c[k]])
-            # elif isinstance(c, list):
-            #     c_in = list()
-            #     assert isinstance(unconditional_conditioning, list)
-            #     for i in range(len(c)):
-            #         c_in.append(torch.cat([unconditional_conditioning[i], c[i]]))
-            # else:
-            #     c_in = torch.cat([unconditional_conditioning, c])
-            x_in = x
-            t_in = t
-            model_t, cond_output_dict_cond = self.model.apply_model(x_in, t_in, c)
-            model_uncond, cond_output_dict_uncond = self.model.apply_model(x_in, t_in, unconditional_conditioning)
-            if isinstance(model_t, tuple):
-                model_t, _ = model_t
-            if isinstance(model_uncond, tuple):
-                model_uncond, _ = model_uncond
-            if cond_output_dict_cond is not None:
-                cond_output_dict = dict()
-                for k in cond_output_dict_cond.keys():
-                    cond_output_dict[k] = torch.cat([cond_output_dict_uncond[k], cond_output_dict_cond[k]])
+            x_in = torch.cat([x] * 2)
+            t_in = torch.cat([t] * 2)
+            if isinstance(c, dict):
+                assert isinstance(unconditional_conditioning, dict)
+                c_in = dict()
+                for k in c:
+                    if isinstance(c[k], list):
+                        c_in[k] = [torch.cat([
+                            unconditional_conditioning[k][i],
+                            c[k][i]]) for i in range(len(c[k]))]
+                    else:
+                        c_in[k] = torch.cat([
+                                unconditional_conditioning[k],
+                                c[k]])
+            elif isinstance(c, list):
+                c_in = list()
+                assert isinstance(unconditional_conditioning, list)
+                for i in range(len(c)):
+                    c_in.append(torch.cat([unconditional_conditioning[i], c[i]]))
             else:
-                cond_output_dict = None
-            # model_output, cond_output_dict = self.model.apply_model(x_in, t_in, c_in)
-            # model_uncond, model_t = model_output.chunk(2)
+                c_in = torch.cat([unconditional_conditioning, c])
+            model_uncond, model_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
             model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
 
         if self.model.parameterization == "v":
@@ -288,8 +248,7 @@ class DDIMSampler(object):
         if noise_dropout > 0.:
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-
-        return x_prev, pred_x0, cond_output_dict
+        return x_prev, pred_x0
 
     @torch.no_grad()
     def encode(self, x0, c, t_enc, use_original_steps=False, return_intermediates=None,
@@ -312,13 +271,13 @@ class DDIMSampler(object):
         for i in tqdm(range(num_steps), desc='Encoding Image'):
             t = torch.full((x0.shape[0],), i, device=self.model.device, dtype=torch.long)
             if unconditional_guidance_scale == 1.:
-                noise_pred = self.model.apply_model(x_next, t, c)[0]
+                noise_pred = self.model.apply_model(x_next, t, c)
             else:
                 assert unconditional_conditioning is not None
                 e_t_uncond, noise_pred = torch.chunk(
                     self.model.apply_model(torch.cat((x_next, x_next)), torch.cat((t, t)),
                                            torch.cat((unconditional_conditioning, c))), 2)
-                noise_pred = e_t_uncond + unconditional_guidance_scale * (noise_pred - e_t_uncond)[0]
+                noise_pred = e_t_uncond + unconditional_guidance_scale * (noise_pred - e_t_uncond)
 
             xt_weighted = (alphas_next[i] / alphas[i]).sqrt() * x_next
             weighted_noise_pred = alphas_next[i].sqrt() * (

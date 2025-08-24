@@ -1,197 +1,164 @@
-import importlib
-
-import torch
-from torch import optim
+import math
 import numpy as np
-
-from inspect import isfunction
-from PIL import Image, ImageDraw, ImageFont
-
-
-def log_txt_as_img(wh, xc, size=10):
-    # wh a tuple of (width, height)
-    # xc a list of captions to plot
-    b = len(xc)
-    txts = list()
-    for bi in range(b):
-        txt = Image.new("RGB", wh, color="white")
-        draw = ImageDraw.Draw(txt)
-        font = ImageFont.truetype('font/DejaVuSans.ttf', size=size)
-        nc = int(40 * (wh[0] / 256))
-        lines = "\n".join(xc[bi][start:start + nc] for start in range(0, len(xc[bi]), nc))
-
-        try:
-            draw.text((0, 0), lines, fill="black", font=font)
-        except UnicodeEncodeError:
-            print("Cant encode string for logging. Skipping.")
-
-        txt = np.array(txt).transpose(2, 0, 1) / 127.5 - 1.0
-        txts.append(txt)
-    txts = np.stack(txts)
-    txts = torch.tensor(txts)
-    return txts
+import matplotlib
+import cv2
 
 
-def ismap(x):
-    if not isinstance(x, torch.Tensor):
-        return False
-    return (len(x.shape) == 4) and (x.shape[1] > 3)
+def padRightDownCorner(img, stride, padValue):
+    h = img.shape[0]
+    w = img.shape[1]
+
+    pad = 4 * [None]
+    pad[0] = 0 # up
+    pad[1] = 0 # left
+    pad[2] = 0 if (h % stride == 0) else stride - (h % stride) # down
+    pad[3] = 0 if (w % stride == 0) else stride - (w % stride) # right
+
+    img_padded = img
+    pad_up = np.tile(img_padded[0:1, :, :]*0 + padValue, (pad[0], 1, 1))
+    img_padded = np.concatenate((pad_up, img_padded), axis=0)
+    pad_left = np.tile(img_padded[:, 0:1, :]*0 + padValue, (1, pad[1], 1))
+    img_padded = np.concatenate((pad_left, img_padded), axis=1)
+    pad_down = np.tile(img_padded[-2:-1, :, :]*0 + padValue, (pad[2], 1, 1))
+    img_padded = np.concatenate((img_padded, pad_down), axis=0)
+    pad_right = np.tile(img_padded[:, -2:-1, :]*0 + padValue, (1, pad[3], 1))
+    img_padded = np.concatenate((img_padded, pad_right), axis=1)
+
+    return img_padded, pad
+
+# transfer caffe model to pytorch which will match the layer name
+def transfer(model, model_weights):
+    transfered_model_weights = {}
+    for weights_name in model.state_dict().keys():
+        transfered_model_weights[weights_name] = model_weights['.'.join(weights_name.split('.')[1:])]
+    return transfered_model_weights
+
+# draw the body keypoint and lims
+def draw_bodypose(canvas, candidate, subset):
+    stickwidth = 4
+    limbSeq = [[2, 3], [2, 6], [3, 4], [4, 5], [6, 7], [7, 8], [2, 9], [9, 10], \
+               [10, 11], [2, 12], [12, 13], [13, 14], [2, 1], [1, 15], [15, 17], \
+               [1, 16], [16, 18], [3, 17], [6, 18]]
+
+    colors = [[255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0], [85, 255, 0], [0, 255, 0], \
+              [0, 255, 85], [0, 255, 170], [0, 255, 255], [0, 170, 255], [0, 85, 255], [0, 0, 255], [85, 0, 255], \
+              [170, 0, 255], [255, 0, 255], [255, 0, 170], [255, 0, 85]]
+    for i in range(18):
+        for n in range(len(subset)):
+            index = int(subset[n][i])
+            if index == -1:
+                continue
+            x, y = candidate[index][0:2]
+            cv2.circle(canvas, (int(x), int(y)), 4, colors[i], thickness=-1)
+    for i in range(17):
+        for n in range(len(subset)):
+            index = subset[n][np.array(limbSeq[i]) - 1]
+            if -1 in index:
+                continue
+            cur_canvas = canvas.copy()
+            Y = candidate[index.astype(int), 0]
+            X = candidate[index.astype(int), 1]
+            mX = np.mean(X)
+            mY = np.mean(Y)
+            length = ((X[0] - X[1]) ** 2 + (Y[0] - Y[1]) ** 2) ** 0.5
+            angle = math.degrees(math.atan2(X[0] - X[1], Y[0] - Y[1]))
+            polygon = cv2.ellipse2Poly((int(mY), int(mX)), (int(length / 2), stickwidth), int(angle), 0, 360, 1)
+            cv2.fillConvexPoly(cur_canvas, polygon, colors[i])
+            canvas = cv2.addWeighted(canvas, 0.4, cur_canvas, 0.6, 0)
+    # plt.imsave("preview.jpg", canvas[:, :, [2, 1, 0]])
+    # plt.imshow(canvas[:, :, [2, 1, 0]])
+    return canvas
 
 
-def isimage(x):
-    if not isinstance(x,torch.Tensor):
-        return False
-    return (len(x.shape) == 4) and (x.shape[1] == 3 or x.shape[1] == 1)
+# image drawed by opencv is not good.
+def draw_handpose(canvas, all_hand_peaks, show_number=False):
+    edges = [[0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8], [0, 9], [9, 10], \
+             [10, 11], [11, 12], [0, 13], [13, 14], [14, 15], [15, 16], [0, 17], [17, 18], [18, 19], [19, 20]]
 
+    for peaks in all_hand_peaks:
+        for ie, e in enumerate(edges):
+            if np.sum(np.all(peaks[e], axis=1)==0)==0:
+                x1, y1 = peaks[e[0]]
+                x2, y2 = peaks[e[1]]
+                cv2.line(canvas, (x1, y1), (x2, y2), matplotlib.colors.hsv_to_rgb([ie/float(len(edges)), 1.0, 1.0])*255, thickness=2)
 
-def exists(x):
-    return x is not None
+        for i, keyponit in enumerate(peaks):
+            x, y = keyponit
+            cv2.circle(canvas, (x, y), 4, (0, 0, 255), thickness=-1)
+            if show_number:
+                cv2.putText(canvas, str(i), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), lineType=cv2.LINE_AA)
+    return canvas
 
+# detect hand according to body pose keypoints
+# please refer to https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/master/src/openpose/hand/handDetector.cpp
+def handDetect(candidate, subset, oriImg):
+    # right hand: wrist 4, elbow 3, shoulder 2
+    # left hand: wrist 7, elbow 6, shoulder 5
+    ratioWristElbow = 0.33
+    detect_result = []
+    image_height, image_width = oriImg.shape[0:2]
+    for person in subset.astype(int):
+        # if any of three not detected
+        has_left = np.sum(person[[5, 6, 7]] == -1) == 0
+        has_right = np.sum(person[[2, 3, 4]] == -1) == 0
+        if not (has_left or has_right):
+            continue
+        hands = []
+        #left hand
+        if has_left:
+            left_shoulder_index, left_elbow_index, left_wrist_index = person[[5, 6, 7]]
+            x1, y1 = candidate[left_shoulder_index][:2]
+            x2, y2 = candidate[left_elbow_index][:2]
+            x3, y3 = candidate[left_wrist_index][:2]
+            hands.append([x1, y1, x2, y2, x3, y3, True])
+        # right hand
+        if has_right:
+            right_shoulder_index, right_elbow_index, right_wrist_index = person[[2, 3, 4]]
+            x1, y1 = candidate[right_shoulder_index][:2]
+            x2, y2 = candidate[right_elbow_index][:2]
+            x3, y3 = candidate[right_wrist_index][:2]
+            hands.append([x1, y1, x2, y2, x3, y3, False])
 
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if isfunction(d) else d
+        for x1, y1, x2, y2, x3, y3, is_left in hands:
+            # pos_hand = pos_wrist + ratio * (pos_wrist - pos_elbox) = (1 + ratio) * pos_wrist - ratio * pos_elbox
+            # handRectangle.x = posePtr[wrist*3] + ratioWristElbow * (posePtr[wrist*3] - posePtr[elbow*3]);
+            # handRectangle.y = posePtr[wrist*3+1] + ratioWristElbow * (posePtr[wrist*3+1] - posePtr[elbow*3+1]);
+            # const auto distanceWristElbow = getDistance(poseKeypoints, person, wrist, elbow);
+            # const auto distanceElbowShoulder = getDistance(poseKeypoints, person, elbow, shoulder);
+            # handRectangle.width = 1.5f * fastMax(distanceWristElbow, 0.9f * distanceElbowShoulder);
+            x = x3 + ratioWristElbow * (x3 - x2)
+            y = y3 + ratioWristElbow * (y3 - y2)
+            distanceWristElbow = math.sqrt((x3 - x2) ** 2 + (y3 - y2) ** 2)
+            distanceElbowShoulder = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            width = 1.5 * max(distanceWristElbow, 0.9 * distanceElbowShoulder)
+            # x-y refers to the center --> offset to topLeft point
+            # handRectangle.x -= handRectangle.width / 2.f;
+            # handRectangle.y -= handRectangle.height / 2.f;
+            x -= width / 2
+            y -= width / 2  # width = height
+            # overflow the image
+            if x < 0: x = 0
+            if y < 0: y = 0
+            width1 = width
+            width2 = width
+            if x + width > image_width: width1 = image_width - x
+            if y + width > image_height: width2 = image_height - y
+            width = min(width1, width2)
+            # the max hand box value is 20 pixels
+            if width >= 20:
+                detect_result.append([int(x), int(y), int(width), is_left])
 
+    '''
+    return value: [[x, y, w, True if left hand else False]].
+    width=height since the network require squared input.
+    x, y is the coordinate of top left 
+    '''
+    return detect_result
 
-def mean_flat(tensor):
-    """
-    https://github.com/openai/guided-diffusion/blob/27c20a8fab9cb472df5d6bdd6c8d11c8f430b924/guided_diffusion/nn.py#L86
-    Take the mean over all non-batch dimensions.
-    """
-    return tensor.mean(dim=list(range(1, len(tensor.shape))))
-
-
-def count_params(model, verbose=False):
-    total_params = sum(p.numel() for p in model.parameters())
-    if verbose:
-        print(f"{model.__class__.__name__} has {total_params*1.e-6:.2f} M params.")
-    return total_params
-
-
-def instantiate_from_config(config):
-    if not "target" in config:
-        if config == '__is_first_stage__':
-            return None
-        elif config == "__is_unconditional__":
-            return None
-        raise KeyError("Expected key `target` to instantiate.")
-    return get_obj_from_str(config["target"])(**config.get("params", dict()))
-
-
-def get_obj_from_str(string, reload=False):
-    module, cls = string.rsplit(".", 1)
-    if reload:
-        module_imp = importlib.import_module(module)
-        importlib.reload(module_imp)
-    return getattr(importlib.import_module(module, package=None), cls)
-
-
-class AdamWwithEMAandWings(optim.Optimizer):
-    # credit to https://gist.github.com/crowsonkb/65f7265353f403714fce3b2595e0b298
-    def __init__(self, params, lr=1.e-3, betas=(0.9, 0.999), eps=1.e-8,  # TODO: check hyperparameters before using
-                 weight_decay=1.e-2, amsgrad=False, ema_decay=0.9999,   # ema decay to match previous code
-                 ema_power=1., param_names=()):
-        """AdamW that saves EMA versions of the parameters."""
-        if not 0.0 <= lr:
-            raise ValueError("Invalid learning rate: {}".format(lr))
-        if not 0.0 <= eps:
-            raise ValueError("Invalid epsilon value: {}".format(eps))
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
-        if not 0.0 <= weight_decay:
-            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
-        if not 0.0 <= ema_decay <= 1.0:
-            raise ValueError("Invalid ema_decay value: {}".format(ema_decay))
-        defaults = dict(lr=lr, betas=betas, eps=eps,
-                        weight_decay=weight_decay, amsgrad=amsgrad, ema_decay=ema_decay,
-                        ema_power=ema_power, param_names=param_names)
-        super().__init__(params, defaults)
-
-    def __setstate__(self, state):
-        super().__setstate__(state)
-        for group in self.param_groups:
-            group.setdefault('amsgrad', False)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        """Performs a single optimization step.
-        Args:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            exp_avg_sqs = []
-            ema_params_with_grad = []
-            state_sums = []
-            max_exp_avg_sqs = []
-            state_steps = []
-            amsgrad = group['amsgrad']
-            beta1, beta2 = group['betas']
-            ema_decay = group['ema_decay']
-            ema_power = group['ema_power']
-
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                params_with_grad.append(p)
-                if p.grad.is_sparse:
-                    raise RuntimeError('AdamW does not support sparse gradients')
-                grads.append(p.grad)
-
-                state = self.state[p]
-
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    # Exponential moving average of gradient values
-                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    # Exponential moving average of squared gradient values
-                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    if amsgrad:
-                        # Maintains max of all exp. moving avg. of sq. grad. values
-                        state['max_exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    # Exponential moving average of parameter values
-                    state['param_exp_avg'] = p.detach().float().clone()
-
-                exp_avgs.append(state['exp_avg'])
-                exp_avg_sqs.append(state['exp_avg_sq'])
-                ema_params_with_grad.append(state['param_exp_avg'])
-
-                if amsgrad:
-                    max_exp_avg_sqs.append(state['max_exp_avg_sq'])
-
-                # update the steps for each param group update
-                state['step'] += 1
-                # record the step after step update
-                state_steps.append(state['step'])
-
-            optim._functional.adamw(params_with_grad,
-                    grads,
-                    exp_avgs,
-                    exp_avg_sqs,
-                    max_exp_avg_sqs,
-                    state_steps,
-                    amsgrad=amsgrad,
-                    beta1=beta1,
-                    beta2=beta2,
-                    lr=group['lr'],
-                    weight_decay=group['weight_decay'],
-                    eps=group['eps'],
-                    maximize=False)
-
-            cur_ema_decay = min(ema_decay, 1 - state['step'] ** -ema_power)
-            for param, ema_param in zip(params_with_grad, ema_params_with_grad):
-                ema_param.mul_(cur_ema_decay).add_(param.float(), alpha=1 - cur_ema_decay)
-
-        return loss
+# get max index of 2d array
+def npmax(array):
+    arrayindex = array.argmax(1)
+    arrayvalue = array.max(1)
+    i = arrayvalue.argmax()
+    j = arrayindex[i]
+    return i, j
